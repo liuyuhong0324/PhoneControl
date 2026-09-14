@@ -209,7 +209,7 @@ pub struct ScrcpyConnection {
 fn run_adb(host: &str, port: u16, args: &[String]) -> Result<std::process::Output, String> {
     let mut full = server_args(host, port);
     full.extend_from_slice(args);
-    std::process::Command::new("adb")
+    std::process::Command::new(super::path::adb_path())
         .args(&full)
         .output()
         .map_err(|e| format!("adb spawn failed: {e}"))
@@ -232,7 +232,7 @@ pub fn remove_forward(host: &str, port: u16, serial: &str, local_port: u16) {
 fn run_adb_spawn(host: &str, port: u16, args: &[String]) -> Result<std::process::Child, String> {
     let mut full = server_args(host, port);
     full.extend_from_slice(args);
-    std::process::Command::new("adb")
+    std::process::Command::new(super::path::adb_path())
         .args(&full)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

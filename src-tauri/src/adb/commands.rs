@@ -3,6 +3,7 @@ use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 use super::device::server_args;
+use super::path::adb_path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandResult {
@@ -32,7 +33,7 @@ struct AdbOutput {
 }
 
 fn run_adb_once(args: &[String], timeout: Duration) -> Result<AdbOutput, String> {
-    let mut child = Command::new("adb")
+    let mut child = Command::new(adb_path())
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -476,7 +477,7 @@ pub fn wake_up_device(host: &str, port: u16, serial: &str) -> CommandResult {
         "power".into(),
     ]);
 
-    let out = match Command::new("adb").args(&check_args).output() {
+    let out = match Command::new(adb_path()).args(&check_args).output() {
         Ok(out) => out,
         Err(e) => {
             return CommandResult {

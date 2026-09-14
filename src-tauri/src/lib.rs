@@ -874,7 +874,9 @@ async fn run_shell_devices(
                 let mut args = server_args(&d.server_host, d.server_port);
                 args.extend(["-s".into(), d.serial.clone(), "shell".into()]);
                 args.extend(cmd.split_whitespace().map(String::from));
-                let out = std::process::Command::new("adb").args(&args).output();
+                let out = std::process::Command::new(adb::path::adb_path())
+                    .args(&args)
+                    .output();
                 match out {
                     Ok(o) => CommandResult {
                         serial: d.serial.clone(),
