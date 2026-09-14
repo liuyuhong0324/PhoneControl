@@ -835,7 +835,8 @@ async fn launch_scrcpy(
 ) -> Result<(), String> {
     let is_remote = !(server_host == "127.0.0.1" || server_host == "localhost");
     tauri::async_runtime::spawn(async move {
-        let mut cmd = tokio::process::Command::new("scrcpy");
+        let mut cmd = tokio::process::Command::new(adb::path::scrcpy_path());
+        adb::path::hide_window_tokio(&mut cmd);
         cmd.args(["-s", &serial]);
         if is_remote {
             cmd.env(
@@ -874,9 +875,9 @@ async fn run_shell_devices(
                 let mut args = server_args(&d.server_host, d.server_port);
                 args.extend(["-s".into(), d.serial.clone(), "shell".into()]);
                 args.extend(cmd.split_whitespace().map(String::from));
-                let out = std::process::Command::new(adb::path::adb_path())
-                    .args(&args)
-                    .output();
+                let mut cmd = std::process::Command::new(adb::path::adb_path());
+                adb::path::hide_window(&mut cmd);
+                let out = cmd.args(&args).output();
                 match out {
                     Ok(o) => CommandResult {
                         serial: d.serial.clone(),

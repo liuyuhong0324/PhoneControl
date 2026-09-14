@@ -85,7 +85,9 @@ pub(crate) fn forward_connect_addr(server_host: &str, local_port: u16) -> String
 }
 
 fn scrcpy_version() -> Result<String, String> {
-    let out = std::process::Command::new("scrcpy")
+    let mut cmd = std::process::Command::new(super::path::scrcpy_path());
+    super::path::hide_window(&mut cmd);
+    let out = cmd
         .arg("--version")
         .output()
         .map_err(|e| format!("failed to run scrcpy --version: {e}"))?;
@@ -99,12 +101,10 @@ fn scrcpy_version() -> Result<String, String> {
 }
 
 fn scrcpy_server_installed_path() -> Result<String, String> {
-    // scrcpy provides the server path via SCRCPY_SERVER_PATH env when built from source.
-    // For standard installs, we can ask scrcpy to print logs at debug level and rely on
-    // the known default locations.
-    // Here we support Homebrew default plus SCRCPY_SERVER_PATH override.
-    if let Ok(p) = std::env::var("SCRCPY_SERVER_PATH") {
-        return Ok(p);
+    // Bundled scrcpy-server next to the app, with SCRCPY_SERVER_PATH override
+    // plus Homebrew defaults as fallbacks.
+    if let Some(p) = super::path::scrcpy_server_path() {
+        return Ok(p.to_string_lossy().into_owned());
     }
 
     let candidates = [
@@ -209,8 +209,9 @@ pub struct ScrcpyConnection {
 fn run_adb(host: &str, port: u16, args: &[String]) -> Result<std::process::Output, String> {
     let mut full = server_args(host, port);
     full.extend_from_slice(args);
-    std::process::Command::new(super::path::adb_path())
-        .args(&full)
+    let mut cmd = std::process::Command::new(super::path::adb_path());
+    super::path::hide_window(&mut cmd);
+    cmd.args(&full)
         .output()
         .map_err(|e| format!("adb spawn failed: {e}"))
 }
@@ -232,8 +233,9 @@ pub fn remove_forward(host: &str, port: u16, serial: &str, local_port: u16) {
 fn run_adb_spawn(host: &str, port: u16, args: &[String]) -> Result<std::process::Child, String> {
     let mut full = server_args(host, port);
     full.extend_from_slice(args);
-    std::process::Command::new(super::path::adb_path())
-        .args(&full)
+    let mut cmd = std::process::Command::new(super::path::adb_path());
+    super::path::hide_window(&mut cmd);
+    cmd.args(&full)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()

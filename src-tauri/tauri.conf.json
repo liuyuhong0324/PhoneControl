@@ -25,7 +25,7 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "../platform-tools/*": "platform-tools/"
+      "../scrcpy/*": "scrcpy/"
     },
     "icon": [
       "icons/32x32.png",

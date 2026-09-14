@@ -8,7 +8,7 @@ use uuid::Uuid;
 use futures_util::StreamExt;
 
 use super::device::{parse_adb_devices, server_args, Device};
-use super::path::adb_path;
+use super::path::{adb_path, hide_window};
 use crate::config::ServerConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,7 +40,9 @@ impl AdbServer {
 }
 
 fn run_adb_timeout(args: &[String], timeout_secs: u64) -> String {
-    let mut child = match Command::new(adb_path())
+    let mut cmd = Command::new(adb_path());
+    hide_window(&mut cmd);
+    let mut child = match cmd
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

@@ -61,8 +61,8 @@ phone-control/
 
 - [Node.js](https://nodejs.org/) >= 18
 - [Rust](https://www.rust-lang.org/tools/install) >= 1.70
-- [ADB](https://developer.android.com/tools/adb)
-- [scrcpy](https://github.com/Genymobile/scrcpy)（可选，用于投屏）
+
+> adb 与 scrcpy 已内置在仓库根目录的 `scrcpy/` 文件夹中，并随安装包一起分发，**无需单独安装**。如需使用系统安装的版本，可设置 `ADB_PATH` / `SCRCPY_PATH` / `SCRCPY_SERVER_PATH` 环境变量覆盖。
 
 ## 快速开始
 
