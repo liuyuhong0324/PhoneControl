@@ -128,6 +128,7 @@ export const useStore = create<AppStore>((set) => ({
     return { pageSize: size, page: Math.min(s.page, totalPages - 1) };
   }),
 
-  overviewMode: false,
+  // Overview mode — on by default so all devices are previewed at startup
+  overviewMode: true,
   setOverviewMode: (on) => set({ overviewMode: on }),
 }));

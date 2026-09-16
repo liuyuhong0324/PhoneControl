@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -8,7 +8,7 @@ use uuid::Uuid;
 use futures_util::StreamExt;
 
 use super::device::{parse_adb_devices, server_args, Device};
-use super::path::{adb_path, hide_window};
+use super::path::{adb_path, ensure_adb_server, hide_window};
 use crate::config::ServerConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,10 +164,31 @@ fn fetch_device_info(serial: &str, srv: &AdbServer) -> Device {
 
 pub async fn poll_all_servers(servers: Arc<Mutex<Vec<AdbServer>>>, app: AppHandle) {
     let servers = servers.lock().await.clone();
+
+    // Snapshot of the last emitted device list. Devices already enriched in a
+    // previous poll skip the info queries entirely — startup fires several
+    // polls back-to-back, and re-querying every device each time floods the
+    // ADB server and starves `adb devices` itself.
+    static LAST_DEVICES: OnceLock<std::sync::Mutex<Vec<Device>>> = OnceLock::new();
+    let last_devices = LAST_DEVICES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let cached = Arc::new(last_devices.lock().unwrap().clone());
+
     let mut tasks = futures_util::stream::FuturesUnordered::new();
+
+    // The adb daemon may not be running yet (nothing listens on 5037 after a
+    // reboot, and `adb devices` then returns nothing). Bring it up first.
+    if servers
+        .iter()
+        .any(|s| s.enabled && (s.host == "127.0.0.1" || s.host == "localhost") && s.port == 5037)
+    {
+        tokio::task::spawn_blocking(ensure_adb_server)
+            .await
+            .ok();
+    }
 
     for srv in servers.into_iter().filter(|s| s.enabled) {
         let srv = srv.clone();
+        let cached = Arc::clone(&cached);
         tasks.push(tokio::spawn(async move {
             let mut args = server_args(&srv.host, srv.port);
             args.push("devices".into());
@@ -184,7 +205,19 @@ pub async fn poll_all_servers(servers: Arc<Mutex<Vec<AdbServer>>>, app: AppHandl
             for (serial, status) in pairs {
                 if status == "device" {
                     online_serials.push(serial.clone());
-                    devices.push(fallback_device(serial, "online".into(), &srv));
+                    // Reuse info from the previous poll when we have it; only
+                    // genuinely new devices need the full enrich pass.
+                    let cached_dev = cached.iter().find(|d| {
+                        d.serial == serial
+                            && d.server_host == srv.host
+                            && d.server_port == srv.port
+                            && d.status == "online"
+                            && !d.model.is_empty()
+                    });
+                    match cached_dev {
+                        Some(d) => devices.push(d.clone()),
+                        None => devices.push(fallback_device(serial, "online".into(), &srv)),
+                    }
                 } else {
                     devices.push(fallback_device(serial, status, &srv));
                 }
@@ -197,6 +230,7 @@ pub async fn poll_all_servers(servers: Arc<Mutex<Vec<AdbServer>>>, app: AppHandl
     let mut all_devices = Vec::new();
     if tasks.is_empty() {
         let _ = app.emit("devices-updated", &all_devices);
+        *last_devices.lock().unwrap() = all_devices;
         return;
     }
 
@@ -205,7 +239,21 @@ pub async fn poll_all_servers(servers: Arc<Mutex<Vec<AdbServer>>>, app: AppHandl
         if let Ok((devices, srv, online_serials)) = result {
             all_devices.extend(devices);
             let _ = app.emit("devices-updated", &all_devices);
-            enrich_jobs.push((srv, online_serials));
+            // Only devices without cached info need the enrich pass.
+            let fresh: Vec<String> = online_serials
+                .into_iter()
+                .filter(|serial| {
+                    !all_devices.iter().any(|d| {
+                        d.serial == *serial
+                            && d.server_host == srv.host
+                            && d.server_port == srv.port
+                            && !d.model.is_empty()
+                    })
+                })
+                .collect();
+            if !fresh.is_empty() {
+                enrich_jobs.push((srv, fresh));
+            }
         }
     }
 
@@ -247,5 +295,8 @@ pub async fn poll_all_servers(servers: Arc<Mutex<Vec<AdbServer>>>, app: AppHandl
                 }
             }
         }
+
+        // Persist for the next poll so cached devices skip re-enrichment.
+        *last_devices.lock().unwrap() = enriched.clone();
     });
 }

@@ -112,3 +112,17 @@ pub fn hide_window_tokio(cmd: &mut tokio::process::Command) {
 
 #[cfg(not(windows))]
 pub fn hide_window_tokio(_cmd: &mut tokio::process::Command) {}
+
+/// Start the ADB server if it isn't running yet. `adb devices` fails outright
+/// ("cannot connect to daemon") when nothing listens on 5037, which surfaces
+/// as an empty device list with no error. Idempotent and cheap once the
+/// daemon is up, so it's safe to call before every poll.
+pub fn ensure_adb_server() {
+    let mut cmd = std::process::Command::new(adb_path());
+    hide_window(&mut cmd);
+    let _ = cmd
+        .args(["start-server"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
