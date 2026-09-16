@@ -12,11 +12,23 @@ pub struct Device {
     pub server_port: u16,
 }
 
-/// Parse `adb devices` output into (serial, status) pairs.
+/// Parse the ADB device list into (serial, status) pairs.
+///
+/// The raw `host:devices` protocol response has NO header — it starts
+/// directly with device lines. The `adb devices` CLI adds a
+/// "List of devices attached" header itself; skipping the first line
+/// unconditionally would silently drop the first device on the protocol
+/// path. Skip it only when it's actually the header.
 pub fn parse_adb_devices(output: &str) -> Vec<(String, String)> {
     output
         .lines()
-        .skip(1) // skip "List of devices attached"
+        .skip_while(|l| l.trim().is_empty())
+        .skip(usize::from(
+            output
+                .lines()
+                .next()
+                .is_some_and(|l| l.starts_with("List of devices")),
+        ))
         .filter_map(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2 {
@@ -64,6 +76,18 @@ mod tests {
         let output = "List of devices attached\n";
         let devices = parse_adb_devices(output);
         assert!(devices.is_empty());
+    }
+
+    #[test]
+    fn test_parse_devices_raw_protocol_no_header() {
+        // Raw `host:devices` response: no "List of devices attached" line.
+        // The first line is a real device and must not be skipped.
+        let output = "8DF6R16801007148\tdevice\n8DF6R16806006359\tdevice\n";
+        let devices = parse_adb_devices(output);
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].0, "8DF6R16801007148");
+        assert_eq!(devices[0].1, "device");
+        assert_eq!(devices[1].0, "8DF6R16806006359");
     }
 
     #[test]
