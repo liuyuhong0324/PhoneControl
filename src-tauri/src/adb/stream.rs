@@ -339,7 +339,7 @@ pub async fn start_stream_loop(
         let connected_at = std::time::Instant::now();
         let stdout = scrcpy_conn.stream;
         let local_port = scrcpy_conn.local_port;
-        let mut server_child = scrcpy_conn.server_child;
+        let server_shell = scrcpy_conn.server_shell;
 
         if let Some(ctrl) = scrcpy_conn.control {
             control_sockets.lock().unwrap().insert(
@@ -413,7 +413,7 @@ pub async fn start_stream_loop(
             }
         };
 
-        super::scrcpy_client::terminate_child(&mut server_child);
+        super::scrcpy_client::shutdown_shell(&server_shell);
         super::scrcpy_client::remove_forward(&host, port, &serial, local_port);
         println!(
             "[SCRCPY] forward listener removed serial={} port={} reason=stream ended",

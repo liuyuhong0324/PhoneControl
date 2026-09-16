@@ -6,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use super::device::server_args;
 use super::stream::StreamOptions;
 
 /// Build the argv that starts the scrcpy server on the device.
@@ -202,52 +201,26 @@ pub struct ScrcpyConnection {
     pub local_port: u16,
     pub stream: TcpStream,
     pub control: Option<TcpStream>,
-    pub server_child: std::process::Child,
+    /// Long-lived shell session running the scrcpy server. Keeping this
+    /// TCP stream open keeps the device-side process alive (same contract the
+    /// previous `adb shell` child had).
+    pub server_shell: TcpStream,
     pub scid: u32,
 }
 
-fn run_adb(host: &str, port: u16, args: &[String]) -> Result<std::process::Output, String> {
-    let mut full = server_args(host, port);
-    full.extend_from_slice(args);
-    let mut cmd = std::process::Command::new(super::path::adb_path());
-    super::path::hide_window(&mut cmd);
-    cmd.args(&full)
-        .output()
-        .map_err(|e| format!("adb spawn failed: {e}"))
+fn run_adb_client(host: &str, port: u16) -> Result<super::protocol::AdbClient, String> {
+    super::protocol::AdbClient::connect(host, port)
 }
 
 pub fn remove_forward(host: &str, port: u16, serial: &str, local_port: u16) {
-    let _ = run_adb(
-        host,
-        port,
-        &[
-            "-s".into(),
-            serial.into(),
-            "forward".into(),
-            "--remove".into(),
-            format!("tcp:{local_port}").into(),
-        ],
-    );
-}
-
-fn run_adb_spawn(host: &str, port: u16, args: &[String]) -> Result<std::process::Child, String> {
-    let mut full = server_args(host, port);
-    full.extend_from_slice(args);
-    let mut cmd = std::process::Command::new(super::path::adb_path());
-    super::path::hide_window(&mut cmd);
-    cmd.args(&full)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("adb spawn failed: {e}"))
-}
-
-pub fn terminate_child(child: &mut std::process::Child) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
+    if let Ok(mut client) = run_adb_client(host, port) {
+        let _ = client.kill_forward(serial, local_port);
     }
-    let _ = child.kill();
-    let _ = child.wait();
+}
+
+fn run_adb_shell_check(host: &str, port: u16, serial: &str, cmd: &str) -> Result<String, String> {
+    let mut client = run_adb_client(host, port)?;
+    client.shell_once(serial, &format!("sh -c {cmd}"))
 }
 
 fn spawn_log_pump(serial: &str, mut reader: impl Read + Send + 'static, stream_name: &'static str) {
@@ -285,22 +258,7 @@ fn spawn_log_pump(serial: &str, mut reader: impl Read + Send + 'static, stream_n
 }
 
 fn adb_shell_check(host: &str, port: u16, serial: &str, cmd: &str) -> Result<String, String> {
-    let out = run_adb(
-        host,
-        port,
-        &[
-            "-s".into(),
-            serial.into(),
-            "shell".into(),
-            "sh".into(),
-            "-c".into(),
-            cmd.into(),
-        ],
-    )?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).to_string());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    run_adb_shell_check(host, port, serial, cmd)
 }
 
 pub fn start_scrcpy_and_connect(
@@ -354,23 +312,10 @@ pub fn start_scrcpy_and_connect(
         );
 
         if runtime.server_size != remote_size {
-            let out = run_adb(
-                server_host,
-                server_port,
-                &[
-                    "-s".into(),
-                    serial.into(),
-                    "push".into(),
-                    runtime.server_path,
-                    remote_path.into(),
-                ],
-            )?;
-            if !out.status.success() {
-                return Err(format!(
-                    "adb push failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                ));
-            }
+            let mut client = run_adb_client(server_host, server_port)?;
+            client
+                .push(serial, &runtime.server_path, remote_path)
+                .map_err(|e| format!("adb push failed: {e}"))?;
             println!(
                 "[SCRCPY] server pushed serial={} remote={} ver={} elapsed={}ms",
                 serial,
@@ -409,12 +354,13 @@ pub fn start_scrcpy_and_connect(
     // Launch style matches the official scrcpy CLI: `adb shell CLASSPATH=... app_process / ...`
     // with individual argv tokens. A `sh -c "..."` wrapper was observed to
     // silence server stderr on some devices (PKG110 / OPPO).
-    let mut argv: Vec<String> = vec!["-s".into(), serial.into(), "shell".into()];
-    argv.extend(start_argv);
-    let mut server_child = run_adb_spawn(server_host, server_port, &argv).map_err(|e| {
-        clear_remote_server_verified(&remote_cache_key);
-        e
-    })?;
+    let argv: Vec<String> = start_argv;
+    let server_shell =
+        super::protocol::AdbClient::shell_stream(server_host, server_port, serial, &argv)
+            .map_err(|e| {
+                clear_remote_server_verified(&remote_cache_key);
+                e
+            })?;
 
     println!(
         "[SCRCPY] server started serial={} scid={:08x} elapsed={}ms (adb shell kept alive)",
@@ -423,11 +369,11 @@ pub fn start_scrcpy_and_connect(
         started_at.elapsed().as_millis()
     );
 
-    if let Some(stdout) = server_child.stdout.take() {
-        spawn_log_pump(serial, stdout, "stdout");
-    }
-    if let Some(stderr) = server_child.stderr.take() {
-        spawn_log_pump(serial, stderr, "stderr");
+    {
+        let log_stream = server_shell
+            .try_clone()
+            .map_err(|e| format!("failed to clone server shell: {e}"))?;
+        spawn_log_pump(serial, log_stream, "stdout");
     }
 
     // 3) Set up the forward tunnel.
@@ -440,30 +386,16 @@ pub fn start_scrcpy_and_connect(
     let socket_name = format!("localabstract:scrcpy_{:08x}", scid);
 
     // Use tcp:0 to let ADB pick a free port, avoiding "Address already in use"
-    let out = run_adb(
-        server_host,
-        server_port,
-        &[
-            "-s".into(),
-            serial.into(),
-            "forward".into(),
-            "tcp:0".into(),
-            socket_name.clone().into(),
-        ],
-    )?;
-    if !out.status.success() {
-        terminate_child(&mut server_child);
-        clear_remote_server_verified(&remote_cache_key);
-        return Err(format!(
-            "adb forward failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    // adb forward tcp:0 prints the allocated port on stdout
-    let actual_port: u16 = String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse()
-        .map_err(|e| format!("failed to parse allocated port: {e}"))?;
+    let actual_port: u16 = {
+        let mut client = run_adb_client(server_host, server_port)?;
+        client
+            .forward_tcp0(serial, &socket_name)
+            .map_err(|e| {
+                shutdown_shell(&server_shell);
+                clear_remote_server_verified(&remote_cache_key);
+                e
+            })?
+    };
     let addr = forward_connect_addr(server_host, actual_port);
 
     println!(
@@ -514,7 +446,7 @@ pub fn start_scrcpy_and_connect(
                 }
             }
             if start.elapsed() > Duration::from_secs(3) {
-                terminate_child(&mut server_child);
+                shutdown_shell(&server_shell);
                 remove_forward(server_host, server_port, serial, actual_port);
                 clear_remote_server_verified(&remote_cache_key);
                 return Err(format!(
@@ -558,9 +490,14 @@ pub fn start_scrcpy_and_connect(
         local_port: actual_port,
         stream,
         control,
-        server_child,
+        server_shell,
         scid,
     })
+}
+
+/// End the server's shell session (replaces killing the adb child process).
+pub fn shutdown_shell(shell: &TcpStream) {
+    let _ = shell.shutdown(std::net::Shutdown::Both);
 }
 
 impl ScrcpyConnection {

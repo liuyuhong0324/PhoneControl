@@ -1,14 +1,15 @@
 use serde::{Deserialize, Serialize};
-use std::process::Command;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use futures_util::StreamExt;
 
-use super::device::{parse_adb_devices, server_args, Device};
-use super::path::{adb_path, ensure_adb_server, hide_window};
+use super::device::Device;
+use super::path::ensure_adb_server;
+use super::protocol::AdbClient;
 use crate::config::ServerConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,45 +40,6 @@ impl AdbServer {
     }
 }
 
-fn run_adb_timeout(args: &[String], timeout_secs: u64) -> String {
-    let mut cmd = Command::new(adb_path());
-    hide_window(&mut cmd);
-    let mut child = match cmd
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return String::new(),
-    };
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return String::new();
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return String::new();
-            }
-        }
-    }
-
-    child
-        .wait_with_output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default()
-}
-
 fn fallback_device(serial: String, status: String, srv: &AdbServer) -> Device {
     Device {
         serial,
@@ -98,14 +60,12 @@ fn fetch_device_info(serial: &str, srv: &AdbServer) -> Device {
     let mut battery: i32 = -1;
 
     // Single adb shell call combining all 3 queries, separated by a sentinel.
-    // This reduces 3 sequential process spawns + round-trips to 1.
+    // This reduces 3 sequential round-trips to 1.
     {
-        let mut args = server_args(&srv.host, srv.port);
-        args.extend([
-            "-s".into(), serial.into(), "shell".into(),
-            "wm size; echo '---DELIM---'; getprop ro.product.model; echo '---DELIM---'; dumpsys battery".into(),
-        ]);
-        let output = run_adb_timeout(&args, 4);
+        let script = "wm size; echo '---DELIM---'; getprop ro.product.model; echo '---DELIM---'; dumpsys battery";
+        let output = AdbClient::connect(&srv.host, srv.port)
+            .and_then(|mut c| c.shell_once_timeout(serial, script, Duration::from_secs(4)))
+            .unwrap_or_default();
         let sections: Vec<&str> = output.split("---DELIM---").collect();
 
         // Section 0: wm size
@@ -188,16 +148,36 @@ pub async fn poll_all_servers(servers: Arc<Mutex<Vec<AdbServer>>>, app: AppHandl
 
     for srv in servers.into_iter().filter(|s| s.enabled) {
         let srv = srv.clone();
+        let srv_for_blocking = srv.clone();
         let cached = Arc::clone(&cached);
+        let app = app.clone();
         tasks.push(tokio::spawn(async move {
-            let mut args = server_args(&srv.host, srv.port);
-            args.push("devices".into());
             // Keep startup responsive: slow/offline ADB servers should not
             // hold back devices discovered from healthy servers.
-            let output = tokio::task::spawn_blocking(move || run_adb_timeout(&args, 5))
-                .await
-                .unwrap_or_default();
-            let pairs = parse_adb_devices(&output);
+            let result = tokio::task::spawn_blocking(move || {
+                let mut client = AdbClient::connect(&srv_for_blocking.host, srv_for_blocking.port)?;
+                client.devices()
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("poll task failed: {e}")));
+
+            let pairs = match result {
+                Ok(p) => p,
+                Err(e) => {
+                    // Surface daemon/connection errors instead of silently
+                    // showing an empty list.
+                    println!("[ADB-POLL] server={}:{} failed: {}", srv.host, srv.port, e);
+                    let _ = app.emit(
+                        "adb-error",
+                        serde_json::json!({
+                            "serverHost": srv.host,
+                            "serverPort": srv.port,
+                            "error": e,
+                        }),
+                    );
+                    Vec::new()
+                }
+            };
 
             let mut devices = Vec::new();
             let mut online_serials = Vec::new();

@@ -161,41 +161,36 @@ async fn run_adb_taps(
     source_width: u32,
     source_height: u32,
 ) -> Vec<CommandResult> {
-    const BATCH: usize = 1;
-    let mut results = Vec::with_capacity(serials.len());
-
-    for (batch_idx, chunk) in serials.chunks(BATCH).enumerate() {
-        if batch_idx > 0 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        let handles: Vec<_> = chunk
-            .iter()
-            .map(|d| {
-                let d = d.clone();
-                tokio::task::spawn_blocking(move || {
-                    adb::commands::tap(
-                        &d.server_host,
-                        d.server_port,
-                        &d.serial,
-                        x,
-                        y,
-                        source_width,
-                        source_height,
-                        d.width,
-                        d.height,
-                    )
-                })
+    // Protocol-level ADB client: no process spawn, so fire all devices at
+    // once. The daemon multiplexes the connections.
+    let handles: Vec<_> = serials
+        .iter()
+        .map(|d| {
+            let d = d.clone();
+            tokio::task::spawn_blocking(move || {
+                adb::commands::tap(
+                    &d.server_host,
+                    d.server_port,
+                    &d.serial,
+                    x,
+                    y,
+                    source_width,
+                    source_height,
+                    d.width,
+                    d.height,
+                )
             })
-            .collect();
-        for h in handles {
-            match h.await {
-                Ok(result) => results.push(result),
-                Err(e) => results.push(CommandResult {
-                    serial: "__adb_worker__".into(),
-                    success: false,
-                    message: format!("ADB tap worker failed: {}", e),
-                }),
-            }
+        })
+        .collect();
+    let mut results = Vec::with_capacity(handles.len());
+    for h in handles {
+        match h.await {
+            Ok(result) => results.push(result),
+            Err(e) => results.push(CommandResult {
+                serial: "__adb_worker__".into(),
+                success: false,
+                message: format!("ADB tap worker failed: {}", e),
+            }),
         }
     }
 
@@ -212,44 +207,37 @@ async fn run_adb_swipes(
     source_width: u32,
     source_height: u32,
 ) -> Vec<CommandResult> {
-    const BATCH: usize = 1;
-    let mut results = Vec::with_capacity(serials.len());
-
-    for (batch_idx, chunk) in serials.chunks(BATCH).enumerate() {
-        if batch_idx > 0 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        let handles: Vec<_> = chunk
-            .iter()
-            .map(|d| {
-                let d = d.clone();
-                tokio::task::spawn_blocking(move || {
-                    adb::commands::swipe(
-                        &d.server_host,
-                        d.server_port,
-                        &d.serial,
-                        x1,
-                        y1,
-                        x2,
-                        y2,
-                        duration_ms,
-                        source_width,
-                        source_height,
-                        d.width,
-                        d.height,
-                    )
-                })
+    let handles: Vec<_> = serials
+        .iter()
+        .map(|d| {
+            let d = d.clone();
+            tokio::task::spawn_blocking(move || {
+                adb::commands::swipe(
+                    &d.server_host,
+                    d.server_port,
+                    &d.serial,
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    duration_ms,
+                    source_width,
+                    source_height,
+                    d.width,
+                    d.height,
+                )
             })
-            .collect();
-        for h in handles {
-            match h.await {
-                Ok(result) => results.push(result),
-                Err(e) => results.push(CommandResult {
-                    serial: "__adb_worker__".into(),
-                    success: false,
-                    message: format!("ADB swipe worker failed: {}", e),
-                }),
-            }
+        })
+        .collect();
+    let mut results = Vec::with_capacity(handles.len());
+    for h in handles {
+        match h.await {
+            Ok(result) => results.push(result),
+            Err(e) => results.push(CommandResult {
+                serial: "__adb_worker__".into(),
+                success: false,
+                message: format!("ADB swipe worker failed: {}", e),
+            }),
         }
     }
 
@@ -264,87 +252,85 @@ async fn run_control_taps(
     source_width: u32,
     source_height: u32,
 ) -> (Vec<CommandResult>, Vec<DeviceResolution>) {
-    const CONTROL_BATCH_SIZE: usize = 1;
-    const CONTROL_BATCH_GAP_MS: u64 = 120;
+    // All devices in parallel: each tap is a 32-byte write to an already
+    // established per-device control socket. The forward listener is kept for
+    // the whole session, so concurrent writes are safe.
+    let mut handles = Vec::new();
+    for d in serials {
+        let socket = {
+            let sockets = control_sockets.lock().unwrap();
+            match sockets.get(&d.serial) {
+                Some(entry) if entry.video_width > 0 && entry.video_height > 0 => {
+                    match entry.stream.try_clone() {
+                        Ok(stream) => Some((stream, entry.video_width, entry.video_height)),
+                        Err(e) => {
+                            println!("[TAP] control clone failed serial={}: {}", d.serial, e);
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        };
+
+        let Some((mut stream, video_width, video_height)) = socket else {
+            continue; // handled as fallback below via un-touched serials
+        };
+
+        let serial = d.serial.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let result = scrcpy_control::inject_tap(
+                &mut stream,
+                x,
+                y,
+                source_width,
+                source_height,
+                video_width,
+                video_height,
+            );
+            CommandResult {
+                serial,
+                success: result.is_ok(),
+                message: result.err().unwrap_or_default(),
+            }
+        });
+
+        handles.push((d.clone(), handle));
+    }
 
     let mut results = Vec::new();
     let mut fallback = Vec::new();
-
-    for (batch_idx, chunk) in serials.chunks(CONTROL_BATCH_SIZE).enumerate() {
-        if batch_idx > 0 {
-            tokio::time::sleep(Duration::from_millis(CONTROL_BATCH_GAP_MS)).await;
+    let touched: std::collections::HashSet<String> = handles
+        .iter()
+        .map(|(d, _)| d.serial.clone())
+        .collect();
+    for d in serials {
+        if !touched.contains(&d.serial) {
+            fallback.push(d.clone());
         }
+    }
 
-        let mut handles = Vec::new();
-        for d in chunk {
-            let socket = {
-                let sockets = control_sockets.lock().unwrap();
-                match sockets.get(&d.serial) {
-                    Some(entry) if entry.video_width > 0 && entry.video_height > 0 => {
-                        match entry.stream.try_clone() {
-                            Ok(stream) => Some((stream, entry.video_width, entry.video_height)),
-                            Err(e) => {
-                                println!("[TAP] control clone failed serial={}: {}", d.serial, e);
-                                None
-                            }
-                        }
-                    }
-                    _ => None,
-                }
-            };
-
-            let Some((mut stream, video_width, video_height)) = socket else {
-                fallback.push(d.clone());
-                continue;
-            };
-
-            println!(
-                "[TAP] scrcpy control send serial={} batch={} screen={}x{}",
-                d.serial, batch_idx, video_width, video_height
-            );
-            let serial = d.serial.clone();
-            let handle = tokio::task::spawn_blocking(move || {
-                let result = scrcpy_control::inject_tap(
-                    &mut stream,
-                    x,
-                    y,
-                    source_width,
-                    source_height,
-                    video_width,
-                    video_height,
-                );
-                CommandResult {
-                    serial,
-                    success: result.is_ok(),
-                    message: result.err().unwrap_or_default(),
-                }
-            });
-
-            handles.push((d.clone(), handle));
-        }
-
-        for (device, handle) in handles {
-            match handle.await {
-                Ok(result) => {
-                    if !result.success {
-                        control_sockets.lock().unwrap().remove(&result.serial);
-                        println!(
-                            "[TAP] scrcpy control failed serial={}: {}; falling back to ADB",
-                            result.serial, result.message
-                        );
-                        fallback.push(device);
-                        continue;
-                    }
-
-                    results.push(result);
-                }
-                Err(e) => {
+    for (device, handle) in handles {
+        match handle.await {
+            Ok(result) => {
+                if !result.success {
+                    control_sockets.lock().unwrap().remove(&result.serial);
                     println!(
-                        "[TAP] scrcpy control tap worker failed serial={}: {}; falling back to ADB",
-                        device.serial, e
+                        "[TAP] scrcpy control failed serial={}: {}; falling back to ADB",
+                        result.serial, result.message
                     );
                     fallback.push(device);
+                    continue;
                 }
+
+                results.push(result);
+            }
+            Err(e) => {
+                println!(
+                    "[TAP] scrcpy control tap worker failed serial={}: {}; falling back to ADB",
+                    device.serial, e
+                );
+                fallback.push(device);
             }
         }
     }
@@ -363,83 +349,72 @@ async fn run_control_swipes(
     source_width: u32,
     source_height: u32,
 ) -> (Vec<CommandResult>, Vec<DeviceResolution>) {
-    const CONTROL_BATCH_SIZE: usize = 4;
-    const CONTROL_BATCH_GAP_MS: u64 = 25;
-
+    // All devices in parallel — same rationale as run_control_taps.
     let mut results = Vec::new();
     let mut fallback = Vec::new();
 
-    for (batch_idx, chunk) in serials.chunks(CONTROL_BATCH_SIZE).enumerate() {
-        if batch_idx > 0 {
-            tokio::time::sleep(Duration::from_millis(CONTROL_BATCH_GAP_MS)).await;
-        }
-
-        let mut handles = Vec::new();
-        for d in chunk {
-            let socket = {
-                let sockets = control_sockets.lock().unwrap();
-                match sockets.get(&d.serial) {
-                    Some(entry) if entry.video_width > 0 && entry.video_height > 0 => {
-                        match entry.stream.try_clone() {
-                            Ok(stream) => Some((
-                                stream,
-                                entry.video_width,
-                                entry.video_height,
-                                entry.stream.local_addr().ok(),
-                                entry.stream.peer_addr().ok(),
-                            )),
-                            Err(e) => {
-                                println!("[SWIPE] control clone failed serial={}: {}", d.serial, e);
-                                None
-                            }
+    let mut handles = Vec::new();
+    for d in serials {
+        let socket = {
+            let sockets = control_sockets.lock().unwrap();
+            match sockets.get(&d.serial) {
+                Some(entry) if entry.video_width > 0 && entry.video_height > 0 => {
+                    match entry.stream.try_clone() {
+                        Ok(stream) => Some((
+                            stream,
+                            entry.video_width,
+                            entry.video_height,
+                            entry.stream.local_addr().ok(),
+                            entry.stream.peer_addr().ok(),
+                        )),
+                        Err(e) => {
+                            println!("[SWIPE] control clone failed serial={}: {}", d.serial, e);
+                            None
                         }
                     }
-                    _ => None,
                 }
-            };
+                _ => None,
+            }
+        };
 
-            let Some((mut stream, video_width, video_height, local_addr, peer_addr)) = socket
-            else {
-                fallback.push(d.clone());
-                continue;
-            };
+        let Some((mut stream, video_width, video_height, local_addr, peer_addr)) = socket
+        else {
+            fallback.push(d.clone());
+            continue;
+        };
 
-            println!(
-                "[SWIPE] scrcpy control send serial={} batch={} screen={}x{}",
-                d.serial, batch_idx, video_width, video_height
-            );
-            let serial = d.serial.clone();
-            let handle = tokio::task::spawn_blocking(move || {
-                let result = scrcpy_control::inject_swipe(
-                    &mut stream,
-                    x1,
-                    y1,
-                    x2,
-                    y2,
-                    duration_ms,
-                    source_width,
-                    source_height,
-                    video_width,
-                    video_height,
-                );
-                CommandResult {
-                    serial,
-                    success: result.is_ok(),
-                    message: result.err().unwrap_or_default(),
-                }
-            });
-
-            handles.push((
-                d.clone(),
-                local_addr,
-                peer_addr,
+        let serial = d.serial.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let result = scrcpy_control::inject_swipe(
+                &mut stream,
+                x1,
+                y1,
+                x2,
+                y2,
+                duration_ms,
+                source_width,
+                source_height,
                 video_width,
                 video_height,
-                handle,
-            ));
-        }
+            );
+            CommandResult {
+                serial,
+                success: result.is_ok(),
+                message: result.err().unwrap_or_default(),
+            }
+        });
 
-        for (device, local_addr, peer_addr, video_width, video_height, handle) in handles {
+        handles.push((
+            d.clone(),
+            local_addr,
+            peer_addr,
+            video_width,
+            video_height,
+            handle,
+        ));
+    }
+
+    for (device, local_addr, peer_addr, video_width, video_height, handle) in handles {
             match handle.await {
                 Ok(result) => {
                     if !result.success {
@@ -484,7 +459,6 @@ async fn run_control_swipes(
                 }
             }
         }
-    }
 
     (results, fallback)
 }
@@ -506,6 +480,7 @@ async fn tap_devices(
         source_width,
         source_height
     );
+    let started = std::time::Instant::now();
 
     let (mut results, fallback) = run_control_taps(
         &serials,
@@ -534,7 +509,8 @@ async fn tap_devices(
     let ok = results.iter().filter(|r| r.success).count();
     let fail = results.len() - ok;
     println!(
-        "[TAP] done: {} ok, {} failed (scrcpy-control={}, adb-fallback={}, devices={})",
+        "[TAP] done in {:?}: {} ok, {} failed (scrcpy-control={}, adb-fallback={}, devices={})",
+        started.elapsed(),
         ok,
         fail,
         serials.len() - fallback.len(),
@@ -561,6 +537,7 @@ async fn swipe_devices(
         serials.len(),
         duration_ms
     );
+    let started = std::time::Instant::now();
 
     let (mut results, fallback) = run_control_swipes(
         &serials,
@@ -604,7 +581,8 @@ async fn swipe_devices(
     let ok = results.iter().filter(|r| r.success).count();
     let fail = results.len() - ok;
     println!(
-        "[SWIPE] done: {} ok, {} failed (scrcpy-control={}, adb-fallback={}, devices={})",
+        "[SWIPE] done in {:?}: {} ok, {} failed (scrcpy-control={}, adb-fallback={}, devices={})",
+        started.elapsed(),
         ok,
         fail,
         serials.len() - fallback.len(),
@@ -866,29 +844,23 @@ async fn run_shell_devices(
     serials: Vec<DeviceResolution>,
     cmd: String,
 ) -> Result<Vec<CommandResult>, String> {
-    use adb::device::server_args;
     let handles: Vec<_> = serials
         .into_iter()
         .map(|d| {
             let cmd = cmd.clone();
             tokio::task::spawn_blocking(move || {
-                let mut args = server_args(&d.server_host, d.server_port);
-                args.extend(["-s".into(), d.serial.clone(), "shell".into()]);
-                args.extend(cmd.split_whitespace().map(String::from));
-                let mut cmd = std::process::Command::new(adb::path::adb_path());
-                adb::path::hide_window(&mut cmd);
-                let out = cmd.args(&args).output();
+                let out = adb::protocol::AdbClient::connect(&d.server_host, d.server_port)
+                    .and_then(|mut c| c.shell_once(&d.serial, &cmd));
                 match out {
                     Ok(o) => CommandResult {
                         serial: d.serial.clone(),
-                        success: o.status.success(),
-                        message: String::from_utf8_lossy(&o.stdout).to_string()
-                            + &String::from_utf8_lossy(&o.stderr),
+                        success: true,
+                        message: o,
                     },
                     Err(e) => CommandResult {
                         serial: d.serial.clone(),
                         success: false,
-                        message: e.to_string(),
+                        message: e,
                     },
                 }
             })

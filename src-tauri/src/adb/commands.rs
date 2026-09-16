@@ -1,9 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
-use super::device::server_args;
-use super::path::{adb_path, hide_window};
+use super::protocol::AdbClient;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandResult {
@@ -26,64 +24,25 @@ fn scale(value: f64, source_dim: u32, target_dim: u32) -> i32 {
     scaled.round().clamp(0.0, max) as i32
 }
 
-struct AdbOutput {
-    status: ExitStatus,
-    stdout: String,
-    stderr: String,
-}
-
-fn run_adb_once(args: &[String], timeout: Duration) -> Result<AdbOutput, String> {
-    let mut cmd = Command::new(adb_path());
-    hide_window(&mut cmd);
-    let mut child = cmd
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn adb: {}", e))?;
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                let output = child
-                    .wait_with_output()
-                    .map_err(|e| format!("Failed to collect adb output: {}", e))?;
-                return Ok(AdbOutput {
-                    status: output.status,
-                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                });
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("ADB command timeout (>{}ms)", timeout.as_millis()));
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("Failed to wait for adb: {}", e));
-            }
-        }
-    }
-}
-
+/// Run a one-shot shell command against a device over the ADB protocol.
+///
+/// The `shell:` service merges stderr into stdout and provides no exit
+/// status; commands like `input tap` print nothing on success, so a non-empty
+/// response is treated as an error message.
 fn run_adb_device_once(
     host: &str,
     port: u16,
     serial: &str,
     shell_args: &[&str],
     timeout: Duration,
-) -> Result<AdbOutput, String> {
-    let mut args = server_args(host, port);
-    args.extend(["-s".into(), serial.into(), "shell".into()]);
-    args.extend(shell_args.iter().map(|s| s.to_string()));
-
-    run_adb_once(&args, timeout)
+) -> Result<String, String> {
+    let cmd = shell_args
+        .iter()
+        .map(|s| shell_quote(s))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut client = AdbClient::connect(host, port)?;
+    client.shell_once_timeout(serial, &cmd, timeout)
 }
 
 fn run_adb_shell_script(
@@ -92,55 +51,63 @@ fn run_adb_shell_script(
     serial: &str,
     script: &str,
     timeout: Duration,
-) -> Result<AdbOutput, String> {
-    let mut args = server_args(host, port);
-    args.extend([
-        "-s".into(),
-        serial.into(),
-        "shell".into(),
-        "sh".into(),
-        "-c".into(),
-        script.into(),
-    ]);
-
-    run_adb_once(&args, timeout)
+) -> Result<String, String> {
+    let mut client = AdbClient::connect(host, port)?;
+    client.shell_once_timeout(serial, &format!("sh -c {}", shell_quote(script)), timeout)
 }
 
 fn run_adb_device(host: &str, port: u16, serial: &str, shell_args: &[&str]) -> Result<(), String> {
     let start = Instant::now();
     let out = run_adb_device_once(host, port, serial, shell_args, Duration::from_secs(5))?;
 
-    if !out.stdout.trim().is_empty() || !out.stderr.trim().is_empty() {
+    let trimmed = out.trim();
+    if !trimmed.is_empty() {
         println!(
-            "[ADB] serial={} status={} out={:?} err={:?} ({:.0}ms)",
+            "[ADB] serial={} out={:?} ({:.0}ms)",
             serial,
-            out.status,
-            out.stdout.trim(),
-            out.stderr.trim(),
+            trimmed,
             start.elapsed().as_millis()
         );
     }
-    if out.status.success() {
+    // Non-empty output from these commands means an error (e.g. "sh: input:
+    // not found" or a Java exception dump).
+    if trimmed.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "ADB command failed: status={} err={} ({:.0}ms)",
-            out.status,
-            out.stderr.trim(),
+            "ADB command failed: {} ({:.0}ms)",
+            trimmed,
             start.elapsed().as_millis()
         ))
     }
 }
 
-fn get_state(host: &str, port: u16, serial: &str) -> Result<String, String> {
-    let mut args = server_args(host, port);
-    args.extend(["-s".into(), serial.into(), "get-state".into()]);
-    let out = run_adb_once(&args, Duration::from_secs(2))?;
-    if out.status.success() {
-        Ok(out.stdout.trim().to_string())
-    } else {
-        Err(out.stderr.trim().to_string())
+/// Quote a token for the remote shell. Wraps in single quotes; input values
+/// we generate (numbers, keycodes) never contain quotes, but user text
+/// (send_text) can.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-/:=,".contains(&b))
+    {
+        return s.to_string();
     }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn get_state(host: &str, port: u16, serial: &str) -> Result<String, String> {
+    // `get-state` is an adb HOST command, not a device shell binary — running
+    // it through `shell:` fails with "/system/bin/sh: get-state: not found"
+    // (and used to stall the stability wait for the full timeout). The
+    // authoritative state lives in the daemon's device list, so look the
+    // serial up there. This also reports offline/unauthorized correctly,
+    // where a transport-based query would just fail.
+    let mut client = AdbClient::connect(host, port)?;
+    let pairs = client.devices()?;
+    pairs
+        .into_iter()
+        .find(|(s, _)| s == serial)
+        .map(|(_, state)| state)
+        .ok_or_else(|| format!("device {serial} not found"))
 }
 
 fn wait_for_device_online(host: &str, port: u16, serial: &str) -> bool {
@@ -200,15 +167,7 @@ echo "persist.sys.usb.config=$persist"
 "#;
 
     let out = run_adb_shell_script(host, port, serial, script, Duration::from_secs(2))?;
-    let stdout = out.stdout.trim();
-    let stderr = out.stderr.trim();
-    if out.status.success() {
-        Ok(stdout.to_string())
-    } else if stderr.is_empty() {
-        Err(format!("get USB props failed: status={}", out.status))
-    } else {
-        Err(format!("get USB props failed: {}", stderr))
-    }
+    Ok(out.trim().to_string())
 }
 
 pub fn verify_usb_file_transfer_after_tap(host: &str, port: u16, serial: &str) -> CommandResult {
@@ -431,25 +390,20 @@ exit 1
     let result = run_adb_shell_script(host, port, serial, script, Duration::from_secs(8));
     match result {
         Ok(out) => {
-            let stdout = out.stdout.trim();
-            let stderr = out.stderr.trim();
-            let message = if stdout.is_empty() {
-                stderr.to_string()
-            } else if stderr.is_empty() {
-                stdout.to_string()
-            } else {
-                format!("{stdout}\n{stderr}")
-            };
+            // The script echoes the confirmed config on success; a
+            // non-empty output without "sys.usb.config=" means failure.
+            let message = out.trim().to_string();
+            let success = message.contains("sys.usb.config=");
             println!(
                 "[USB-MTP] serial={} success={} msg={:?} ({:.0}ms)",
                 serial,
-                out.status.success(),
+                success,
                 message,
                 start.elapsed().as_millis()
             );
             CommandResult {
                 serial: serial.to_string(),
-                success: out.status.success(),
+                success,
                 message,
             }
         }
@@ -470,39 +424,18 @@ exit 1
 }
 
 pub fn wake_up_device(host: &str, port: u16, serial: &str) -> CommandResult {
-    let mut check_args = server_args(host, port);
-    check_args.extend([
-        "-s".into(),
-        serial.into(),
-        "shell".into(),
-        "dumpsys".into(),
-        "power".into(),
-    ]);
-
-    let out = match {
-        let mut cmd = Command::new(adb_path());
-        hide_window(&mut cmd);
-        cmd.args(&check_args).output()
-    } {
-        Ok(out) => out,
+    let output = match AdbClient::connect(host, port)
+        .and_then(|mut c| c.shell_once(serial, "dumpsys power"))
+    {
+        Ok(o) => o,
         Err(e) => {
             return CommandResult {
                 serial: serial.to_string(),
                 success: false,
-                message: e.to_string(),
+                message: e,
             }
         }
     };
-
-    if !out.status.success() {
-        return CommandResult {
-            serial: serial.to_string(),
-            success: false,
-            message: format!("Failed to check device state: {}", out.status),
-        };
-    }
-
-    let output = String::from_utf8_lossy(&out.stdout);
     if output.contains("mWakefulness=Asleep") {
         let result = run_adb_device(host, port, serial, &["input", "keyevent", "26"]);
         CommandResult {
