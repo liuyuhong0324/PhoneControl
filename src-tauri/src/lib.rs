@@ -815,7 +815,10 @@ async fn launch_scrcpy(
     tauri::async_runtime::spawn(async move {
         let mut cmd = tokio::process::Command::new(adb::path::scrcpy_path());
         adb::path::hide_window_tokio(&mut cmd);
-        cmd.args(["-s", &serial]);
+        // Turn the device panel off while mirroring: saves battery and heat on
+        // the phone during long group-control sessions, and prevents the
+        // physical screen from being touched by accident.
+        cmd.args(["-s", &serial, "--turn-screen-off"]);
         if is_remote {
             cmd.env(
                 "ADB_SERVER_SOCKET",
