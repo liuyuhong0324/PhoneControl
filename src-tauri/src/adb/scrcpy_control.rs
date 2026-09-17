@@ -8,6 +8,67 @@ const ACTION_MOVE: u8 = 2;
 const POINTER_ID_FINGER: u64 = 0xFFFF_FFFF_FFFF_FFFE;
 const PRESSURE_MAX: u16 = 0xFFFF;
 
+/// `SC_CONTROL_MSG_TYPE_SET_DISPLAY_POWER` (position 10 in the scrcpy 3.x
+/// control message enum, right after SET_CLIPBOARD). This is the message the
+/// scrcpy CLIENT sends to implement `--turn-screen-off`: the server has no
+/// `turn_screen_off` option (verified against the 3.3.4 server dex), the
+/// client drives display power over the control channel.
+const SET_DISPLAY_POWER: u8 = 10;
+const DISPLAY_POWER_OFF: u8 = 0;
+const DISPLAY_POWER_NORMAL: u8 = 1;
+
+/// `SC_CONTROL_MSG_TYPE_RESET_VIDEO`, the last entry of the scrcpy 3.x control
+/// message enum (position 17, after START_APP). It makes the server tear down
+/// and restart the video encoder, which immediately emits a fresh codec config
+/// plus a keyframe.
+///
+/// The positional anchors are all verified against the 3.3.4 server dex and
+/// live devices: INJECT_TOUCH_EVENT = 2 and SET_DISPLAY_POWER = 10.
+///
+/// Why the app needs it: these devices only emit an IDR when the picture
+/// changes. `video_codec_options=i-frame-interval=1` is silently ignored by the
+/// HiSilicon encoder, so a preview tile that subscribes to an idle (or
+/// screen-off, therefore not recomposited) device receives no keyframe at all —
+/// it stays black until the next tap happens to generate one. Measured: 0 video
+/// packets in 6s while idle, then config + keyframe 0.17s after this byte.
+const RESET_VIDEO: u8 = 17;
+
+/// Build the display-power control message: 1 byte type + 1 byte mode.
+pub(crate) fn build_display_power_msg(off: bool) -> [u8; 2] {
+    [
+        SET_DISPLAY_POWER,
+        if off {
+            DISPLAY_POWER_OFF
+        } else {
+            DISPLAY_POWER_NORMAL
+        },
+    ]
+}
+
+/// Ask the server for a fresh codec config + keyframe.
+///
+/// Used to prime a decoder that just subscribed (or that missed frames): the
+/// video is H.264, so nothing after the request is decodable until this lands.
+pub fn inject_reset_video(stream: &mut TcpStream) -> Result<(), String> {
+    stream
+        .write_all(&[RESET_VIDEO])
+        .map_err(|e| format!("reset video write failed: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("reset video flush failed: {e}"))
+}
+
+/// Turn the device display off (or back to normal) while mirroring continues.
+/// Equivalent to scrcpy's `--turn-screen-off`.
+pub fn inject_display_power(stream: &mut TcpStream, off: bool) -> Result<(), String> {
+    stream
+        .write_all(&build_display_power_msg(off))
+        .map_err(|e| format!("display power write failed: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("display power flush failed: {e}"))
+}
+
 pub(crate) fn build_touch_msg(
     action: u8,
     x: i32,
@@ -248,5 +309,41 @@ mod tests {
     fn scale_clamps_to_target_bounds() {
         assert_eq!(scale(-10.0, 200, 1080), 0);
         assert_eq!(scale(200.0, 200, 1080), 1079);
+    }
+
+    #[test]
+    fn display_power_message_layout() {
+        // Message 10 = SET_DISPLAY_POWER in the scrcpy 3.x control enum
+        // (verified against scrcpy-server 3.3.4: sending [0x0a, 0x00] makes the
+        // server log "Device display turned off").
+        assert_eq!(build_display_power_msg(true), [10, 0]);
+        assert_eq!(build_display_power_msg(false), [10, 1]);
+    }
+
+    #[test]
+    fn touch_message_type_matches_scrcpy_enum() {
+        // INJECT_TOUCH_EVENT = 2 — anchors the enum position the display-power
+        // message index is derived from.
+        assert_eq!(build_touch_msg(ACTION_DOWN, 0, 0, 1, 1, 0)[0], 2);
+    }
+
+    #[test]
+    fn reset_video_writes_a_single_byte_17() {
+        // TYPE_RESET_VIDEO is position 17 in the scrcpy 3.x control enum (after
+        // START_APP = 16) and carries no payload. Verified on a live device:
+        // the server answers with a fresh codec config + keyframe 0.17s later.
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        inject_reset_video(&mut client).unwrap();
+
+        let mut byte = [0u8; 1];
+        server.read_exact(&mut byte).unwrap();
+        assert_eq!(byte[0], 17);
     }
 }

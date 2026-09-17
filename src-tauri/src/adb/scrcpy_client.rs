@@ -36,7 +36,13 @@ pub(crate) fn build_start_argv(
         format!("scid={scid:08x}"),
         "log_level=info".into(),
         "audio=false".into(),
-        "control=false".into(),
+        // Control stays ON: scrcpy implements `--turn-screen-off` by sending a
+        // SET_DISPLAY_POWER control message (there is no `turn_screen_off`
+        // server option — verified against the 3.3.4 server dex), and we want
+        // the device panel dark during mirroring. The server also refuses to
+        // stream any video beyond the dummy byte until a client connects the
+        // control socket, so this is on the critical path either way.
+        "control=true".into(),
         "tunnel_forward=true".into(),
         "stay_awake=true".into(),
         format!("max_size={}", opts.max_size),
@@ -470,10 +476,31 @@ pub fn start_scrcpy_and_connect(
         .set_read_timeout(Some(Duration::from_millis(500)))
         .ok();
 
-    // Embedded multi-device preview prioritizes video startup. scrcpy control
-    // requires a second socket accept; if that socket races or fails, some
-    // devices sit forever after the dummy byte without producing frames.
-    let control = None;
+    // 5) Control socket — must be connected here, before the caller starts
+    // reading frames.
+    //
+    // The server accepts the video connection first and then blocks waiting
+    // for the control connection: with the video socket alone it sends the
+    // dummy byte and then nothing at all (verified against scrcpy-server
+    // 3.3.4). So a control socket that never connects leaves the preview
+    // frozen — which is why it used to be disabled. Connecting it is not
+    // optional once `control=true`.
+    let mut control = connect_control_socket(&addr, serial)?;
+
+    // Blank the device panel while mirroring, like the scrcpy CLI's
+    // `--turn-screen-off`: saves battery/heat and keeps the phone screens from
+    // being touched during long sessions. Video and injected input keep
+    // working with the display off.
+    match super::scrcpy_control::inject_display_power(&mut control, true) {
+        Ok(()) => println!("[SCRCPY] display off requested serial={}", serial),
+        Err(e) => {
+            // Not fatal: mirroring works with the panel on.
+            println!(
+                "[SCRCPY] display off failed serial={}: {} (screen stays on)",
+                serial, e
+            );
+        }
+    }
 
     // Keep the forward mapping for the whole scrcpy session, like the native
     // scrcpy client does. Removing it immediately leaves active connections
@@ -489,10 +516,44 @@ pub fn start_scrcpy_and_connect(
         serial: serial.to_string(),
         local_port: actual_port,
         stream,
-        control,
+        control: Some(control),
         server_shell,
         scid,
     })
+}
+
+/// Connect the scrcpy control socket to an established session.
+///
+/// The server is already listening (it accepted the video connection), so a
+/// second connection to the same forward is queued and picked up as the
+/// control connection. Two failure modes are handled: the connect itself can
+/// fail while the device-side server is still warming up, and it can succeed
+/// locally while the device side is already gone (adb accepts the connection
+/// and then closes it) — that one shows up as an immediate EOF, so we peek.
+fn connect_control_socket(addr: &str, serial: &str) -> Result<TcpStream, String> {
+    let start = std::time::Instant::now();
+    loop {
+        let err = match TcpStream::connect(addr) {
+            Ok(s) => {
+                s.set_nodelay(true).ok();
+                s.set_read_timeout(Some(Duration::from_millis(300))).ok();
+                let mut peek = [0u8; 1];
+                match s.peek(&mut peek) {
+                    // EOF: adb accepted the connection but the device side is
+                    // already gone.
+                    Ok(0) => "immediate EOF (server not ready)".to_string(),
+                    _ => return Ok(s), // data, timeout or WouldBlock: alive
+                }
+            }
+            Err(e) => e.to_string(),
+        };
+        if start.elapsed() > Duration::from_secs(3) {
+            return Err(format!(
+                "control socket connect failed for serial={serial}: {err}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
 }
 
 /// End the server's shell session (replaces killing the adb child process).
@@ -552,7 +613,7 @@ mod tests {
         assert!(cmd.contains("max_fps=30"));
         assert!(cmd.contains("video_bit_rate=4000000"));
         assert!(cmd.contains("audio=false"));
-        assert!(cmd.contains("control=false"));
+        assert!(cmd.contains("control=true"));
         assert!(cmd.contains("send_frame_meta=true"));
     }
 
@@ -643,7 +704,10 @@ mod tests {
         assert!(argv.iter().any(|a| a == "scid=0000abcd"));
         assert!(argv.iter().any(|a| a == "tunnel_forward=true"));
         assert!(argv.iter().any(|a| a == "audio=false"));
-        assert!(argv.iter().any(|a| a == "control=false"));
+        // Control must stay on: the server blocks all video output after the
+        // dummy byte until a client connects the control socket, and it is the
+        // channel used to blank the panel (`--turn-screen-off`).
+        assert!(argv.iter().any(|a| a == "control=true"));
         assert!(argv.iter().any(|a| a == "stay_awake=true"));
     }
 

@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     io::Read,
+    net::TcpStream,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -84,6 +85,12 @@ pub struct ControlEntry {
     pub stream: std::net::TcpStream,
     pub video_width: u32,
     pub video_height: u32,
+    /// When we last asked this device for a fresh keyframe — see
+    /// [`request_keyframe`]. `None` means "never asked", which must not be
+    /// throttled: the first client to subscribe right after a stream starts
+    /// relies on it. Guards against reset storms when a client keeps falling
+    /// behind.
+    pub last_keyframe_request: Option<std::time::Instant>,
 }
 
 pub type ControlSockets = Arc<std::sync::Mutex<std::collections::HashMap<String, ControlEntry>>>;
@@ -98,11 +105,78 @@ pub fn new_control_sockets() -> ControlSockets {
 
 fn remove_control_socket(control_sockets: &ControlSockets, serial: &str, reason: &str) {
     if let Ok(mut sockets) = control_sockets.lock() {
-        if sockets.remove(serial).is_some() {
+        if let Some(mut entry) = sockets.remove(serial) {
+            // Mirroring blanked the device panel (scrcpy `--turn-screen-off`
+            // semantics). Ask for the screen back BEFORE dropping the control
+            // socket: the server stops reading it the moment it sees EOF, and
+            // the fallback cleanup path can be short-circuited when the server
+            // shell is torn down right after.
+            let _ = super::scrcpy_control::inject_display_power(&mut entry.stream, false);
             println!(
-                "[SCRCPY-CTRL] removed control socket serial={} reason={}",
+                "[SCRCPY-CTRL] removed control socket serial={} reason={} (screen restored)",
                 serial, reason
             );
+        }
+    }
+}
+
+/// Turn every mirrored device's screen back on.
+///
+/// Called from the app exit handler: mirroring blanks the panel (scrcpy
+/// `--turn-screen-off` semantics), and stream teardown never runs on process
+/// exit, so without this the phones would stay dark until physically touched.
+pub fn restore_all_displays(control_sockets: &ControlSockets) {
+    let mut entries: Vec<(String, TcpStream)> = match control_sockets.lock() {
+        Ok(mut map) => map.drain().map(|(serial, entry)| (serial, entry.stream)).collect(),
+        Err(_) => return,
+    };
+    if entries.is_empty() {
+        return;
+    }
+    for (serial, stream) in entries.iter_mut() {
+        match super::scrcpy_control::inject_display_power(stream, false) {
+            Ok(()) => println!("[SCRCPY-CTRL] screen restored on exit serial={}", serial),
+            Err(e) => println!("[SCRCPY-CTRL] screen restore failed serial={}: {}", serial, e),
+        }
+    }
+    // Keep the sockets open just long enough for the devices to read the
+    // message before the process goes away.
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    drop(entries);
+}
+
+/// Ask a device for a fresh codec config + keyframe, rate limited per device.
+///
+/// Video only becomes decodable again from a keyframe onward, and these
+/// encoders emit IDRs on picture change only (`i-frame-interval` is ignored),
+/// so partners of this call are: a preview client that just subscribed, and
+/// the frame fan-out dropping packets it could not deliver. Both leave a
+/// decoder waiting for a keyframe that would otherwise never come.
+///
+/// Returns true when the request was actually sent.
+pub fn request_keyframe(control_sockets: &ControlSockets, serial: &str) -> bool {
+    const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+    let Ok(mut sockets) = control_sockets.lock() else {
+        return false;
+    };
+    let Some(entry) = sockets.get_mut(serial) else {
+        return false;
+    };
+    if entry
+        .last_keyframe_request
+        .is_some_and(|last| last.elapsed() < MIN_INTERVAL)
+    {
+        return false;
+    }
+    entry.last_keyframe_request = Some(std::time::Instant::now());
+    match super::scrcpy_control::inject_reset_video(&mut entry.stream) {
+        Ok(()) => {
+            println!("[SCRCPY-CTRL] keyframe requested serial={}", serial);
+            true
+        }
+        Err(e) => {
+            println!("[SCRCPY-CTRL] keyframe request failed serial={}: {}", serial, e);
+            false
         }
     }
 }
@@ -348,8 +422,15 @@ pub async fn start_stream_loop(
                     stream: ctrl,
                     video_width: 0,
                     video_height: 0,
+                    last_keyframe_request: None,
                 },
             );
+            // A tile that mounted while this stream was still starting has its
+            // keyframe request queued in the hub — the socket to send it on
+            // exists only now.
+            app.state::<WsHub>()
+                .inner()
+                .flush_pending_keyframe(&serial);
         }
 
         let serial_for_task = serial.clone();
@@ -413,6 +494,10 @@ pub async fn start_stream_loop(
             }
         };
 
+        // Give the server a moment to process the display-power restore that
+        // remove_control_socket just sent before we tear its shell down —
+        // killing it first would leave the device panel dark.
+        std::thread::sleep(std::time::Duration::from_millis(150));
         super::scrcpy_client::shutdown_shell(&server_shell);
         super::scrcpy_client::remove_forward(&host, port, &serial, local_port);
         println!(
@@ -559,6 +644,7 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
     let mut last_idle_log: Option<std::time::Instant> = None;
     let mut last_config: Option<Vec<u8>> = None;
     let mut first_packet_forwarded = false;
+    let mut first_keyframe_forwarded = false;
     let mut packet_seq: u64 = 0;
 
     println!("[SCRCPY-FWD] entering read loop serial={}", serial);
@@ -622,6 +708,17 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
             println!("[SCRCPY-FWD] first bytes serial={} n={}", serial, n);
         }
         buf.extend_from_slice(&chunk[..n]);
+
+        // No decodable picture yet: these encoders emit nothing at all until the
+        // device picture changes, so a freshly started stream (and any tile that
+        // subscribed while it was starting) would sit blank until the first tap.
+        // Keep asking once the server has had time to start its encoder — the
+        // callee rate limits the retries, and the loop stops at the first
+        // keyframe.
+        if !first_keyframe_forwarded && loop_start.elapsed() > std::time::Duration::from_millis(1200)
+        {
+            request_keyframe(control_sockets, serial);
+        }
 
         if !dummy_consumed && !buf.is_empty() {
             if buf[0] == 0 {
@@ -710,6 +807,9 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
                 hub.broadcast(serial, packed);
             } else {
                 let packet_type = if is_key { 1u8 } else { 2 };
+                if is_key {
+                    first_keyframe_forwarded = true;
+                }
                 // For keyframes, prepend the last config (SPS/PPS) so the
                 // decoder can be (re-)configured even if it missed the
                 // initial config packet due to late WS subscription.
@@ -835,5 +935,42 @@ mod tests {
         let delay = reconnect_delay_ms("device-a", 6, true, false);
 
         assert_eq!(delay, MAX_RECONNECT_SLEEP_MS);
+    }
+
+    /// Two fake devices (plain TCP pairs) stand in for control sockets: after
+    /// `restore_all_displays` every peer must have received the display-power
+    /// NORMAL message, and the registry must be emptied so no later teardown
+    /// tries to reuse a socket that is already gone.
+    #[test]
+    fn restore_all_displays_sends_normal_power_to_every_socket() {
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+
+        let sockets = new_control_sockets();
+        let mut peers = Vec::new();
+        for serial in ["device-a", "device-b"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (peer, _) = listener.accept().unwrap();
+            sockets.lock().unwrap().insert(
+                serial.to_string(),
+                ControlEntry {
+                    stream: client,
+                    video_width: 0,
+                    video_height: 0,
+                    last_keyframe_request: None,
+                },
+            );
+            peers.push(peer);
+        }
+
+        restore_all_displays(&sockets);
+
+        assert!(sockets.lock().unwrap().is_empty());
+        for peer in peers.iter_mut() {
+            let mut msg = [0u8; 2];
+            peer.read_exact(&mut msg).unwrap();
+            assert_eq!(msg, [10, 1], "expected SET_DISPLAY_POWER / NORMAL");
+        }
     }
 }

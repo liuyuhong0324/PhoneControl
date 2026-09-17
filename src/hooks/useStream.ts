@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useStore } from '../store';
 import { getCanvas } from '../utils/canvasRegistry';
 import {
@@ -11,6 +12,22 @@ import {
 export const WS_URL = 'ws://127.0.0.1:32199';
 const MAX_RECONNECT_DELAY_MS = 5000;
 const BASE_RECONNECT_DELAY_MS = 200;
+const KEYFRAME_REQUEST_MIN_MS = 1000;
+
+// H.264 only resumes at a keyframe, and this device fleet emits one only when
+// the picture changes, so a decoder that lost frames stays frozen unless we ask
+// the device for a fresh keyframe. Rate limited per device, matching the
+// backend's own throttle.
+const lastKeyframeRequest = new Map<string, number>();
+
+function requestKeyframe(serial: string) {
+  const now = Date.now();
+  if (now - (lastKeyframeRequest.get(serial) ?? 0) < KEYFRAME_REQUEST_MIN_MS) return;
+  lastKeyframeRequest.set(serial, now);
+  invoke('request_keyframe', { serial }).catch((e) => {
+    console.warn(`[keyframe] request failed serial=${serial}:`, e);
+  });
+}
 
 function deviceStreamSource(d: { serial: string; server_host: string; server_port: number }) {
   return `${d.server_host}:${d.server_port}:${d.serial}`;
@@ -191,6 +208,7 @@ export function useStream() {
           const current = decoders.get(serial);
           if (current?.decoder === decoder) {
             resetDecoder(serial);
+            requestKeyframe(serial);
           }
         },
       });
@@ -264,6 +282,7 @@ export function useStream() {
         state.lastSeq = frame.seq;
         if (hasGap && frame.packetType === 2) {
           resetDecoder(frame.serial);
+          requestKeyframe(frame.serial);
           return;
         }
         if (hasGap && frame.packetType === 1) {
@@ -306,6 +325,7 @@ export function useStream() {
       const queueSize = state.decoder.decodeQueueSize;
       if (frame.packetType === 2 && queueSize > 2) {
         state.waitingForKeyframe = true;
+        requestKeyframe(frame.serial);
         return;
       }
 

@@ -693,6 +693,18 @@ async fn wake_up_devices(serials: Vec<DeviceResolution>) -> Result<Vec<CommandRe
 
 // ── scrcpy control ───────────────────────────────────────────────────────────
 
+/// Ask a mirrored device for a fresh keyframe.
+///
+/// The browser calls this when its decoder cannot continue — a dropped packet
+/// gap or a decode queue it fell behind on. H.264 cannot resume mid-GOP, and
+/// these encoders only emit an IDR when the picture changes, so without this
+/// the tile would stay frozen until the next tap. Rate limited per device in
+/// [`adb::stream::request_keyframe`], and a no-op when the stream is gone.
+#[tauri::command]
+fn request_keyframe(serial: String, state: State<'_, AppState>) {
+    adb::stream::request_keyframe(&state.control_sockets, &serial);
+}
+
 #[tauri::command]
 async fn scrcpy_tap(
     serial: String,
@@ -906,7 +918,7 @@ pub fn run() {
     let servers: Vec<AdbServer> = servers_cfg.iter().map(AdbServer::from_config).collect();
     let app_state = AppState::new(servers);
 
-    let ws_hub = WsHub::default();
+    let ws_hub = WsHub::new(Arc::clone(&app_state.control_sockets));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -923,6 +935,7 @@ pub fn run() {
             swipe_devices,
             scrcpy_tap,
             scrcpy_swipe,
+            request_keyframe,
             send_text_devices,
             keyevent_devices,
             set_usb_file_transfer_devices,
@@ -940,7 +953,25 @@ pub fn run() {
             // Start local WS server for high-frequency frames
             let hub = app.state::<WsHub>().inner().clone();
             tauri::async_runtime::spawn(async move {
-                let _ = run_ws_server(hub, "127.0.0.1:32199".parse().unwrap()).await;
+                // A bind failure here means NO video ever reaches the frontend,
+                // so it must not be swallowed: on Windows an orphaned webview
+                // child can keep 32199 bound after a hard kill, and the new
+                // instance then loses every frame with no visible error.
+                let addr = "127.0.0.1:32199".parse().unwrap();
+                loop {
+                    match run_ws_server(hub.clone(), addr).await {
+                        Ok(()) => {
+                            eprintln!("[WS] server loop ended unexpectedly, restarting");
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[WS] FATAL: cannot serve video frames on {addr}: {e} \
+                                 (another process may hold the port)"
+                            );
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
             });
 
             tauri::async_runtime::spawn(async move {
@@ -951,6 +982,15 @@ pub fn run() {
             });
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Mirroring blanks the device panels, and the per-stream teardown
+            // never runs when the process exits — so restore them here, or the
+            // phones stay dark until someone touches them.
+            if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+                let state = app_handle.state::<AppState>();
+                adb::stream::restore_all_displays(&state.control_sockets);
+            }
+        });
 }

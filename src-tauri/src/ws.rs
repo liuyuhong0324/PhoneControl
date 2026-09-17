@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
@@ -20,9 +20,51 @@ pub type FrameSender = mpsc::Sender<Bytes>;
 pub struct WsHub {
     inner: Arc<Mutex<HashMap<String, Vec<(usize, FrameSender)>>>>,
     next_id: Arc<std::sync::atomic::AtomicUsize>,
+    /// Control sockets of the live streams, used to ask a device for a fresh
+    /// keyframe (see [`crate::adb::stream::request_keyframe`]).
+    control_sockets: Option<crate::adb::stream::ControlSockets>,
+    /// Serials a client asked for a keyframe before their stream had a control
+    /// socket to send on — a tile subscribes the moment it mounts, which can
+    /// beat the stream it is waiting for. Flushed by
+    /// [`WsHub::flush_pending_keyframe`].
+    pending_keyframes: Arc<Mutex<HashSet<String>>>,
 }
 
 impl WsHub {
+    pub fn new(control_sockets: crate::adb::stream::ControlSockets) -> Self {
+        Self {
+            control_sockets: Some(control_sockets),
+            ..Self::default()
+        }
+    }
+
+    /// Ask the device behind `serial` for a keyframe its decoders can start
+    /// from. If the stream is still starting, the request is remembered until
+    /// its control socket exists.
+    fn request_keyframe(&self, serial: &str) {
+        let Some(sockets) = &self.control_sockets else {
+            return;
+        };
+        if !crate::adb::stream::request_keyframe(sockets, serial) {
+            self.pending_keyframes
+                .lock()
+                .unwrap()
+                .insert(serial.to_string());
+        }
+    }
+
+    /// Send the keyframe request that was queued before the stream had a
+    /// control socket. Called once the socket is registered.
+    pub fn flush_pending_keyframe(&self, serial: &str) {
+        let Some(sockets) = &self.control_sockets else {
+            return;
+        };
+        let was_pending = self.pending_keyframes.lock().unwrap().remove(serial);
+        if was_pending {
+            crate::adb::stream::request_keyframe(sockets, serial);
+        }
+    }
+
     /// v4 frame format — raw H.264 NAL data for WebCodecs decoding.
     ///
     /// `packet_type`: 0 = config (SPS/PPS), 1 = keyframe, 2 = delta.
@@ -54,20 +96,32 @@ impl WsHub {
     }
 
     pub fn broadcast(&self, serial: &str, bytes: Vec<u8>) {
-        let mut map = self.inner.lock().unwrap();
-        let Some(list) = map.get_mut(serial) else {
-            return;
-        };
-        let shared: Bytes = bytes.into();
-        list.retain(|(_id, tx)| match tx.try_send(shared.clone()) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => {
-                // Realtime video must not build latency. If the browser is
-                // behind, drop this frame and keep the subscription alive.
-                true
-            }
-            Err(TrySendError::Closed(_)) => false,
-        });
+        let mut dropped = false;
+        {
+            let mut map = self.inner.lock().unwrap();
+            let Some(list) = map.get_mut(serial) else {
+                return;
+            };
+            let shared: Bytes = bytes.into();
+            list.retain(|(_id, tx)| match tx.try_send(shared.clone()) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => {
+                    // Realtime video must not build latency. If the browser is
+                    // behind, drop this frame and keep the subscription alive —
+                    // but remember it: the client now has a gap and its decoder
+                    // waits for a keyframe.
+                    dropped = true;
+                    true
+                }
+                Err(TrySendError::Closed(_)) => false,
+            });
+        }
+        if dropped {
+            // H.264 cannot be resumed mid-GOP, and these encoders only emit an
+            // IDR when the picture changes, so a decoder that lost packets
+            // would otherwise stay blank until the next tap.
+            self.request_keyframe(serial);
+        }
     }
 }
 
@@ -122,11 +176,17 @@ pub async fn run_ws_server(hub: WsHub, addr: SocketAddr) -> Result<(), String> {
                                     let id = hub
                                         .next_id
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    let mut map = hub.inner.lock().unwrap();
-                                    map.entry(serial.to_string())
-                                        .or_default()
-                                        .push((id, out_tx.clone()));
+                                    {
+                                        let mut map = hub.inner.lock().unwrap();
+                                        map.entry(serial.to_string())
+                                            .or_default()
+                                            .push((id, out_tx.clone()));
+                                    }
                                     subscribed.insert(serial.to_string(), id);
+                                    // The tile is on screen now: without a
+                                    // keyframe it would render nothing until the
+                                    // device picture happens to change.
+                                    hub.request_keyframe(serial);
                                 }
                             }
                             "unsubscribe" => {
