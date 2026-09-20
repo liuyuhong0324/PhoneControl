@@ -114,7 +114,7 @@ export const useStore = create<AppStore>((set) => ({
   groupInputBusy: false,
   setGroupInputBusy: (busy) => set({ groupInputBusy: busy }),
 
-  fps: 10,
+  fps: 30,
   setFps: (fps) => set({ fps }),
 
   sidebarCollapsed: false,
