@@ -104,8 +104,20 @@ pub fn new_control_sockets() -> ControlSockets {
 }
 
 fn remove_control_socket(control_sockets: &ControlSockets, serial: &str, reason: &str) {
+    // A standalone scrcpy window (the ▶ button) owns the panel while it is
+    // open: it turned the display off itself, and it turns it back on when it
+    // exits. Restoring here would light the panel while that window mirrors.
+    let standalone_open = has_standalone_scrcpy(serial);
     if let Ok(mut sockets) = control_sockets.lock() {
         if let Some(mut entry) = sockets.remove(serial) {
+            if standalone_open {
+                println!(
+                    "[SCRCPY-CTRL] removed control socket serial={} reason={} \
+                     (left dark: standalone scrcpy owns the panel)",
+                    serial, reason
+                );
+                return;
+            }
             // Mirroring blanked the device panel (scrcpy `--turn-screen-off`
             // semantics). Ask for the screen back BEFORE dropping the control
             // socket: the server stops reading it the moment it sees EOF, and
@@ -117,6 +129,60 @@ fn remove_control_socket(control_sockets: &ControlSockets, serial: &str, reason:
                 serial, reason
             );
         }
+    }
+}
+
+/// Devices with a standalone scrcpy window open.
+///
+/// Display power is a per-device (HWC) state, not a per-session one, so two
+/// scrcpy sessions on the same device fight over it. In particular a standalone
+/// scrcpy turns the panel back ON when it exits — which silently cancels the
+/// preview stream's `--turn-screen-off`, since the preview only sends that
+/// message once, when it connects.
+static STANDALONE_SESSIONS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn standalone_sessions() -> &'static std::sync::Mutex<HashSet<String>> {
+    STANDALONE_SESSIONS.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// Record that a standalone scrcpy window opened (`true`) or closed (`false`).
+pub fn mark_standalone_scrcpy(serial: &str, open: bool) {
+    let Ok(mut sessions) = standalone_sessions().lock() else {
+        return;
+    };
+    if open {
+        sessions.insert(serial.to_string());
+    } else {
+        sessions.remove(serial);
+    }
+}
+
+pub fn has_standalone_scrcpy(serial: &str) -> bool {
+    standalone_sessions()
+        .lock()
+        .map(|sessions| sessions.contains(serial))
+        .unwrap_or(false)
+}
+
+/// Put a mirrored device's panel back to what the preview expects (dark).
+///
+/// Needed after anything else has set a different display power on the device —
+/// most importantly when a standalone scrcpy window closes. A no-op when no
+/// preview stream is running for that device.
+pub fn reassert_display_off(control_sockets: &ControlSockets, serial: &str) {
+    let Ok(mut sockets) = control_sockets.lock() else {
+        return;
+    };
+    let Some(entry) = sockets.get_mut(serial) else {
+        return;
+    };
+    match super::scrcpy_control::inject_display_power(&mut entry.stream, true) {
+        Ok(()) => println!("[SCRCPY-CTRL] display off re-asserted serial={}", serial),
+        Err(e) => println!(
+            "[SCRCPY-CTRL] display off re-assert failed serial={}: {}",
+            serial, e
+        ),
     }
 }
 
@@ -134,6 +200,15 @@ pub fn restore_all_displays(control_sockets: &ControlSockets) {
         return;
     }
     for (serial, stream) in entries.iter_mut() {
+        // A standalone scrcpy window still owns the panel: it is mirroring with
+        // the display off and will restore it when it exits on its own.
+        if has_standalone_scrcpy(serial) {
+            println!(
+                "[SCRCPY-CTRL] left serial={} dark on exit: standalone scrcpy owns the panel",
+                serial
+            );
+            continue;
+        }
         match super::scrcpy_control::inject_display_power(stream, false) {
             Ok(()) => println!("[SCRCPY-CTRL] screen restored on exit serial={}", serial),
             Err(e) => println!("[SCRCPY-CTRL] screen restore failed serial={}: {}", serial, e),
@@ -937,40 +1012,149 @@ mod tests {
         assert_eq!(delay, MAX_RECONNECT_SLEEP_MS);
     }
 
+    /// Register a fake streaming device: a plain TCP pair stands in for scrcpy's
+    /// control socket. Returns the peer end — what the device would receive.
+    ///
+    /// Each test uses its own serial (the standalone-window registry and the
+    /// control-socket map are per-process) and its own socket map.
+    fn fake_control_socket(sockets: &ControlSockets, serial: &str) -> std::net::TcpStream {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        sockets.lock().unwrap().insert(
+            serial.to_string(),
+            ControlEntry {
+                stream: client,
+                video_width: 0,
+                video_height: 0,
+                last_keyframe_request: None,
+            },
+        );
+        peer
+    }
+
+    /// `Some([10, n])` if the device received a display-power message within
+    /// 200ms, `None` if the app left the panel alone.
+    fn try_read_display_power(peer: &mut std::net::TcpStream) -> Option<[u8; 2]> {
+        use std::io::Read;
+
+        let mut msg = [0u8; 2];
+        match peer.read_exact(&mut msg) {
+            Ok(()) => Some(msg),
+            Err(_) => None,
+        }
+    }
+
     /// Two fake devices (plain TCP pairs) stand in for control sockets: after
     /// `restore_all_displays` every peer must have received the display-power
     /// NORMAL message, and the registry must be emptied so no later teardown
     /// tries to reuse a socket that is already gone.
     #[test]
     fn restore_all_displays_sends_normal_power_to_every_socket() {
-        use std::io::Read;
-        use std::net::{TcpListener, TcpStream};
-
         let sockets = new_control_sockets();
-        let mut peers = Vec::new();
-        for serial in ["device-a", "device-b"] {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (peer, _) = listener.accept().unwrap();
-            sockets.lock().unwrap().insert(
-                serial.to_string(),
-                ControlEntry {
-                    stream: client,
-                    video_width: 0,
-                    video_height: 0,
-                    last_keyframe_request: None,
-                },
-            );
-            peers.push(peer);
-        }
+        let mut peers: Vec<_> = ["device-a", "device-b"]
+            .iter()
+            .map(|serial| fake_control_socket(&sockets, serial))
+            .collect();
 
         restore_all_displays(&sockets);
 
         assert!(sockets.lock().unwrap().is_empty());
         for peer in peers.iter_mut() {
-            let mut msg = [0u8; 2];
-            peer.read_exact(&mut msg).unwrap();
-            assert_eq!(msg, [10, 1], "expected SET_DISPLAY_POWER / NORMAL");
+            assert_eq!(
+                try_read_display_power(peer),
+                Some([10, 1]),
+                "expected SET_DISPLAY_POWER / NORMAL"
+            );
         }
+    }
+
+    /// The reported bug: a standalone scrcpy window turns the panel back on as
+    /// it exits, cancelling the preview stream's one-shot `--turn-screen-off`.
+    /// The stream must put it back.
+    #[test]
+    fn reassert_display_off_blanks_a_live_preview() {
+        let sockets = new_control_sockets();
+        let mut peer = fake_control_socket(&sockets, "reassert-live");
+
+        reassert_display_off(&sockets, "reassert-live");
+
+        assert_eq!(
+            try_read_display_power(&mut peer),
+            Some([10, 0]),
+            "expected SET_DISPLAY_POWER / OFF"
+        );
+        // The stream keeps running — only the panel state was re-sent.
+        assert!(sockets.lock().unwrap().contains_key("reassert-live"));
+    }
+
+    #[test]
+    fn reassert_display_off_is_a_noop_without_a_preview_stream() {
+        let sockets = new_control_sockets();
+
+        // Nothing is mirroring this device, so the panel is the user's business.
+        reassert_display_off(&sockets, "reassert-idle");
+
+        assert!(sockets.lock().unwrap().is_empty());
+    }
+
+    /// Normal teardown: nothing else is mirroring, so the panel must come back.
+    #[test]
+    fn remove_control_socket_restores_the_panel() {
+        let sockets = new_control_sockets();
+        let mut peer = fake_control_socket(&sockets, "teardown-plain");
+
+        remove_control_socket(&sockets, "teardown-plain", "test");
+
+        assert!(sockets.lock().unwrap().is_empty());
+        assert_eq!(
+            try_read_display_power(&mut peer),
+            Some([10, 1]),
+            "expected SET_DISPLAY_POWER / NORMAL"
+        );
+    }
+
+    /// Preview teardown while a standalone window is open must leave the panel
+    /// dark: the window turned it off and will turn it back on when it closes.
+    #[test]
+    fn remove_control_socket_leaves_the_panel_dark_for_a_standalone_window() {
+        let sockets = new_control_sockets();
+        let mut peer = fake_control_socket(&sockets, "teardown-standalone");
+        mark_standalone_scrcpy("teardown-standalone", true);
+
+        remove_control_socket(&sockets, "teardown-standalone", "test");
+
+        assert!(sockets.lock().unwrap().is_empty());
+        assert_eq!(
+            try_read_display_power(&mut peer),
+            None,
+            "the standalone window owns the panel, so nothing may be sent"
+        );
+        mark_standalone_scrcpy("teardown-standalone", false);
+        assert!(!has_standalone_scrcpy("teardown-standalone"));
+    }
+
+    /// Same rule on app exit: only devices whose panel the app is holding dark.
+    #[test]
+    fn restore_all_displays_skips_devices_with_a_standalone_window() {
+        let sockets = new_control_sockets();
+        let mut plain = fake_control_socket(&sockets, "exit-plain");
+        let mut standalone = fake_control_socket(&sockets, "exit-standalone");
+        mark_standalone_scrcpy("exit-standalone", true);
+
+        restore_all_displays(&sockets);
+
+        assert!(sockets.lock().unwrap().is_empty());
+        assert_eq!(try_read_display_power(&mut plain), Some([10, 1]));
+        assert_eq!(
+            try_read_display_power(&mut standalone),
+            None,
+            "the standalone window restores its own panel when it exits"
+        );
+        mark_standalone_scrcpy("exit-standalone", false);
     }
 }

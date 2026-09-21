@@ -822,8 +822,13 @@ async fn launch_scrcpy(
     serial: String,
     server_host: String,
     server_port: u16,
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
     let is_remote = !(server_host == "127.0.0.1" || server_host == "localhost");
+    let control_sockets = Arc::clone(&state.control_sockets);
+    // The window owns the device panel for as long as it is open, so preview
+    // teardown must leave it alone (see `adb::stream::remove_control_socket`).
+    adb::stream::mark_standalone_scrcpy(&serial, true);
     tauri::async_runtime::spawn(async move {
         let mut cmd = tokio::process::Command::new(adb::path::scrcpy_path());
         adb::path::hide_window_tokio(&mut cmd);
@@ -839,6 +844,19 @@ async fn launch_scrcpy(
             cmd.args(["--tunnel-host", &server_host]);
         }
         let _ = cmd.status().await;
+        adb::stream::mark_standalone_scrcpy(&serial, false);
+        // scrcpy turns the panel back on as it exits, which silently cancels
+        // the preview stream's own `--turn-screen-off` — that is sent once,
+        // when the stream connects, so nothing else would put it back.
+        //
+        // Twice, because the exit is not a single event. Measured on a live
+        // device: the panel comes back on ~0.5s after scrcpy.exe returns, when
+        // the device-side server dies and restores the display from its own
+        // cleanup — so a message sent in the gap is overwritten. Repeat once
+        // that server must be gone.
+        adb::stream::reassert_display_off(&control_sockets, &serial);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        adb::stream::reassert_display_off(&control_sockets, &serial);
     });
     Ok(())
 }
