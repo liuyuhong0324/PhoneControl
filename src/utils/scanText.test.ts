@@ -11,6 +11,7 @@ function progress(overrides: Partial<ScanProgress> = {}): ScanProgress {
     total: 254,
     found: [],
     connected: 0,
+    alreadyConnected: 0,
     done: false,
     error: null,
     ...overrides,
@@ -47,6 +48,22 @@ describe('scanProgressText', () => {
   it('stays quiet for a finished sweep with nothing to say', () => {
     expect(scanProgressText(progress({ done: true, total: 0 }))).toBeNull();
   });
+
+  it('separates what was found from what was already connected', () => {
+    const text = scanProgressText(
+      progress({ done: true, scanned: 233, found: ['a:5555'], connected: 1, alreadyConnected: 21 }),
+    );
+
+    expect(text).toBe('Scan: 1 found, 1 attached · 21 already connected');
+  });
+
+  /// The usual refresh now that the fleet stays connected: everything in the
+  /// segment is on the daemon already, so nothing is probed at all.
+  it('says nothing was new when the whole segment was already connected', () => {
+    const text = scanProgressText(progress({ done: true, total: 0, alreadyConnected: 21 }));
+
+    expect(text).toBe('21 already connected · nothing new');
+  });
 });
 
 describe('scanProgressDetail', () => {
@@ -59,7 +76,18 @@ describe('scanProgressDetail', () => {
   });
 
   it('says so when nothing answered', () => {
-    expect(scanProgressDetail(progress({ done: true, scanned: 254 }))).toBe('no devices answered');
+    expect(scanProgressDetail(progress({ done: true, scanned: 254 }))).toBe('no new devices answered');
+  });
+
+  it('says how many were skipped because they are already connected', () => {
+    const probed = scanProgressDetail(
+      progress({ done: true, scanned: 233, total: 233, alreadyConnected: 21 }),
+    );
+    expect(probed).toBe('no new devices answered\n21 already connected, not probed');
+
+    // Nothing was probed at all: the only thing to say is what is already there.
+    const none = scanProgressDetail(progress({ done: true, total: 0, alreadyConnected: 21 }));
+    expect(none).toBe('21 already connected, not probed');
   });
 
   it('appends the reason a found device could not be attached', () => {

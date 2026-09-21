@@ -12,9 +12,17 @@ export function scanProgressText(progress: ScanProgress | null): string | null {
     // A segment that could not even be read: there is nothing to report but
     // the reason.
     if (progress.total === 0) {
-      return progress.error ? `Scan failed: ${progress.error}` : null;
+      if (progress.error) return `Scan failed: ${progress.error}`;
+      // Nothing was probed because everything in the segment is already
+      // attached — "0 found" would read as a failure, so say what is there.
+      return progress.alreadyConnected
+        ? `${progress.alreadyConnected} already connected · nothing new`
+        : null;
     }
-    return `Scan: ${progress.found.length} found, ${progress.connected} attached`;
+    const summary = `Scan: ${progress.found.length} found, ${progress.connected} attached`;
+    return progress.alreadyConnected
+      ? `${summary} · ${progress.alreadyConnected} already connected`
+      : summary;
   }
 
   return `Scanning ${progress.segment} ${progress.scanned}/${progress.total} · found ${progress.found.length}`;
@@ -28,11 +36,13 @@ export function scanProgressText(progress: ScanProgress | null): string | null {
 export function scanProgressDetail(progress: ScanProgress | null): string | undefined {
   if (!progress) return undefined;
 
-  const lines = progress.found.length
-    ? [...progress.found]
-    : progress.done && progress.total > 0
-      ? ['no devices answered']
-      : [];
+  const lines = progress.found.length ? [...progress.found] : [];
+  if (progress.done) {
+    if (!lines.length && progress.total > 0) lines.push('no new devices answered');
+    if (progress.alreadyConnected) {
+      lines.push(`${progress.alreadyConnected} already connected, not probed`);
+    }
+  }
   if (progress.error) lines.push(progress.error);
   return lines.length ? lines.join('\n') : undefined;
 }

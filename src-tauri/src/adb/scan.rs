@@ -14,8 +14,8 @@
 //! address, and filters out everything that is not there before we make the
 //! daemon talk to it.
 
-use std::collections::HashSet;
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::collections::{HashMap, HashSet};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use futures_util::stream::{self, StreamExt};
@@ -31,7 +31,13 @@ pub const DEFAULT_ADB_TCP_PORT: u16 = 5555;
 /// A device that is up answers in microseconds; this is for the ones that are
 /// not there at all, which is nearly every address in a sweep.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(400);
-const MAX_CONCURRENT_PROBES: usize = 64;
+/// A /24 is 254 addresses and the sweep should feel instant, so nearly all of
+/// them are in flight at once. The connects are async (a socket each, not a
+/// thread each), which is what makes a number this high reasonable.
+const MAX_CONCURRENT_PROBES: usize = 256;
+/// A phone that has just been attached can sit at `offline` for a moment before
+/// it is up, so the daemon is asked what it ended up with only after this.
+const ATTACH_SETTLE: Duration = Duration::from_millis(400);
 /// A /22 is already 1022 addresses; anything wider is a typo, and sweeping it
 /// would take minutes.
 const MAX_ADDRESSES: usize = 1024;
@@ -144,9 +150,19 @@ fn mask_for(prefix: u32) -> u32 {
 }
 
 /// Does anything answer on this address? A plain TCP connect: the adb daemon
-/// is not involved, so this works before anything is connected.
-fn probe(ip: Ipv4Addr, port: u16) -> bool {
-    TcpStream::connect_timeout(&SocketAddr::from((ip, port)), PROBE_TIMEOUT).is_ok()
+/// is not involved, so this works before anything is connected. A closed port
+/// answers with a refusal in microseconds; the timeout is for addresses that are
+/// not there at all, which on a LAN is most of them.
+async fn probe(ip: Ipv4Addr, port: u16) -> bool {
+    let addr = SocketAddr::from((ip, port));
+    matches!(
+        tokio::time::timeout(
+            PROBE_TIMEOUT,
+            tokio::net::TcpStream::connect(addr)
+        )
+        .await,
+        Ok(Ok(_)) // the connection is dropped here; the probe is the whole point
+    )
 }
 
 /// One sweep's state, emitted as the `scan-progress` event.
@@ -158,10 +174,16 @@ pub struct ScanProgress {
     pub daemon_port: u16,
     pub segment: String,
     pub scanned: u32,
+    /// Addresses this sweep actually probes — the ones the daemon is already
+    /// connected to are not among them.
     pub total: u32,
     /// Addresses that answered, as `ip:port` — what the user cares about.
     pub found: Vec<String>,
     pub connected: u32,
+    /// Devices in the segment that were attached before this sweep ran, so a
+    /// refresh that found nothing new can say so instead of reporting a fleet
+    /// of 0s.
+    pub already_connected: u32,
     pub done: bool,
     /// Why a sweep could not run or could not attach everything it found.
     pub error: Option<String>,
@@ -196,6 +218,44 @@ fn attach_daemon(servers: &[AdbServer]) -> (String, u16) {
         .unwrap_or_else(|| (LOCAL_HOST.to_string(), LOCAL_ADB_PORT))
 }
 
+/// The network addresses in a `host:devices` listing, and what the daemon makes
+/// of each. A USB serial is not an address, so it is not in the answer.
+fn network_devices(devices: Vec<(String, String)>) -> HashMap<Ipv4Addr, String> {
+    devices
+        .into_iter()
+        .filter_map(|(serial, status)| match serial.parse::<SocketAddr>() {
+            Ok(SocketAddr::V4(addr)) => Some((*addr.ip(), status)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What the daemon makes of each wireless address it holds: `device` for the
+/// ones that are up, `offline` or `unauthorized` for the ones that are not.
+async fn device_statuses(host: &str, port: u16) -> HashMap<Ipv4Addr, String> {
+    let host = host.to_string();
+    tokio::task::spawn_blocking(move || {
+        AdbClient::connect(&host, port).and_then(|mut client| client.devices())
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .map(network_devices)
+    .unwrap_or_default()
+}
+
+/// The addresses the daemon holds as up. A sweep has nothing to do for those:
+/// they work already, and probing them would report a discovery every time the
+/// user refreshes.
+async fn attached_addresses(host: &str, port: u16) -> HashSet<Ipv4Addr> {
+    device_statuses(host, port)
+        .await
+        .into_iter()
+        .filter(|(_, status)| status == "device")
+        .map(|(ip, _)| ip)
+        .collect()
+}
+
 /// Sweep every enabled entry's network, then attach what answers.
 ///
 /// Progress is reported while each segment is swept, then one final event
@@ -205,8 +265,12 @@ fn attach_daemon(servers: &[AdbServer]) -> (String, u16) {
 /// the same.
 pub async fn scan_segments(servers: Vec<AdbServer>, app: AppHandle) {
     let (daemon_host, daemon_port) = attach_daemon(&servers);
+    // What is already connected needs no probing, and is worth telling apart
+    // from what a refresh actually found.
+    let attached = attached_addresses(&daemon_host, daemon_port).await;
     let mut claimed: HashSet<Ipv4Addr> = HashSet::new();
     let mut plans: Vec<(String, Vec<Ipv4Addr>)> = Vec::new();
+    let mut already_in_segments = 0u32;
     // Every segment the user asked for, in order, for the final event; and
     // whatever went wrong, held back until the sweep is over so one bad entry
     // does not end the run early in the UI.
@@ -220,11 +284,12 @@ pub async fn scan_segments(servers: Vec<AdbServer>, app: AppHandle) {
         }
         match expand_segment(&spec) {
             Ok(ips) => {
+                already_in_segments += ips.iter().filter(|ip| attached.contains(ip)).count() as u32;
                 // Overlapping segments are common (two entries on one LAN):
                 // every address is probed once, by the entry that claimed it.
                 let fresh: Vec<Ipv4Addr> = ips
                     .into_iter()
-                    .filter(|ip| claimed.insert(*ip))
+                    .filter(|ip| !attached.contains(ip) && claimed.insert(*ip))
                     .collect();
                 if !fresh.is_empty() {
                     plans.push((spec, fresh));
@@ -238,15 +303,23 @@ pub async fn scan_segments(servers: Vec<AdbServer>, app: AppHandle) {
     }
 
     if plans.is_empty() {
-        // Nothing to sweep. A segment that could not be read is the one thing
-        // worth saying, so the entry shows why it did nothing.
-        if !errors.is_empty() {
+        // Nothing to probe: a segment that could not be read, or one the daemon
+        // already covers. Both are worth saying — "0 found" on its own would
+        // read as a failure.
+        if !errors.is_empty() || already_in_segments > 0 {
             emit(
                 &app,
                 &ScanProgress {
+                    daemon_host: daemon_host.clone(),
+                    daemon_port,
                     segment: segments.join(", "),
+                    already_connected: already_in_segments,
                     done: true,
-                    error: Some(errors.join("; ")),
+                    error: if errors.is_empty() {
+                        None
+                    } else {
+                        Some(errors.join("; "))
+                    },
                     ..Default::default()
                 },
             );
@@ -257,13 +330,17 @@ pub async fn scan_segments(servers: Vec<AdbServer>, app: AppHandle) {
     let started = Instant::now();
     let mut total_addresses = 0u32;
     let mut found: Vec<String> = Vec::new();
-    let mut connected = 0u32;
+    let mut found_ips_all: Vec<Ipv4Addr> = Vec::new();
+    // What the daemon accepted, before its own list is asked whether the address
+    // is really a phone.
+    let mut accepted = 0u32;
 
     for (spec, ips) in plans {
         println!(
-            "[SCAN] sweeping {} ({} addresses) via {}:{}",
+            "[SCAN] sweeping {} ({} addresses, {} already connected) via {}:{}",
             spec,
             ips.len(),
+            already_in_segments,
             daemon_host,
             daemon_port
         );
@@ -281,22 +358,23 @@ pub async fn scan_segments(servers: Vec<AdbServer>, app: AppHandle) {
                 segment: spec.clone(),
                 scanned: 0,
                 total,
+                already_connected: already_in_segments,
                 ..Default::default()
             },
         );
-        // Probing is blocking, and a sweep is mostly timeouts — run a bounded
-        // number at a time on the blocking pool so a /24 finishes in seconds
-        // instead of minutes.
+        // A sweep is mostly timeouts, so every probe runs at once — as an async
+        // connect, which is a socket rather than a thread, so a whole /24 is in
+        // flight without touching the blocking pool.
         let mut probes = stream::iter(ips)
-            .map(|ip| tokio::task::spawn_blocking(move || (ip, probe(ip, DEFAULT_ADB_TCP_PORT))))
+            .map(|ip| async move { (ip, probe(ip, DEFAULT_ADB_TCP_PORT).await) })
             .buffer_unordered(MAX_CONCURRENT_PROBES);
 
         let mut found_ips: Vec<Ipv4Addr> = Vec::new();
         let mut scanned: u32 = 0;
         let mut last_emit = Instant::now();
-        while let Some(result) = probes.next().await {
+        while let Some((ip, answered)) = probes.next().await {
             scanned += 1;
-            if let Ok((ip, true)) = result {
+            if answered {
                 found_ips.push(ip);
             }
             // One event per address would flood the webview during a sweep.
@@ -312,6 +390,7 @@ pub async fn scan_segments(servers: Vec<AdbServer>, app: AppHandle) {
                         segment: spec.clone(),
                         scanned,
                         total,
+                        already_connected: already_in_segments,
                         // Everything that has answered so far this refresh,
                         // including the segments swept before this one.
                         found: found
@@ -349,7 +428,7 @@ pub async fn scan_segments(servers: Vec<AdbServer>, app: AppHandle) {
             let port = daemon_port;
             let addresses: Vec<Ipv4Addr> = found_ips.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                let mut connected = 0u32;
+                let mut accepted = 0u32;
                 let mut failures: Vec<String> = Vec::new();
                 for ip in addresses {
                     let addr = format!("{ip}:{DEFAULT_ADB_TCP_PORT}");
@@ -358,7 +437,7 @@ pub async fn scan_segments(servers: Vec<AdbServer>, app: AppHandle) {
                     });
                     match result {
                         Ok(message) => {
-                            connected += 1;
+                            accepted += 1;
                             println!("[SCAN] attached {addr} via {host}:{port} ({message})");
                         }
                         Err(e) => {
@@ -367,17 +446,18 @@ pub async fn scan_segments(servers: Vec<AdbServer>, app: AppHandle) {
                         }
                     }
                 }
-                (connected, failures)
+                (accepted, failures)
             })
             .await
             .unwrap_or_else(|e| (0, vec![format!("attach task failed: {e}")]));
 
-            connected += outcome.0;
+            accepted += outcome.0;
             if !outcome.1.is_empty() {
                 errors.extend(outcome.1);
             }
         }
 
+        found_ips_all.extend(found_ips.iter().cloned());
         found.extend(
             found_ips
                 .iter()
@@ -385,11 +465,34 @@ pub async fn scan_segments(servers: Vec<AdbServer>, app: AppHandle) {
         );
     }
 
+    // `host:connect` answering OKAY means the daemon took the address, not that
+    // there is a phone behind it: anything that accepted the probe looks the same
+    // from there. The daemon's own list is the answer — a device that is up is a
+    // device this refresh gained; one that is offline is a port that was not adb.
+    let mut connected = 0u32;
+    if !found_ips_all.is_empty() {
+        tokio::time::sleep(ATTACH_SETTLE).await;
+        let statuses = device_statuses(&daemon_host, daemon_port).await;
+        for ip in &found_ips_all {
+            match statuses.get(ip).map(String::as_str) {
+                Some("device") => connected += 1,
+                Some(status) => errors.push(format!(
+                    "{ip}:{DEFAULT_ADB_TCP_PORT}: answered, but adb holds it as {status}"
+                )),
+                None => errors.push(format!(
+                    "{ip}:{DEFAULT_ADB_TCP_PORT}: answered, but the adb daemon did not take it"
+                )),
+            }
+        }
+    }
+
     println!(
-        "[SCAN] {}/{} answered, attached {} in {:?}",
+        "[SCAN] {} answered of {} probed, {} already connected, {} up of {} accepted in {:?}",
         found.len(),
         total_addresses,
+        already_in_segments,
         connected,
+        accepted,
         started.elapsed()
     );
     emit(
@@ -402,6 +505,7 @@ pub async fn scan_segments(servers: Vec<AdbServer>, app: AppHandle) {
             total: total_addresses,
             found,
             connected,
+            already_connected: already_in_segments,
             done: true,
             error: if errors.is_empty() {
                 None
@@ -504,8 +608,9 @@ mod tests {
 
     /// The probe is the part that decides what gets attached, so it has to be
     /// right about both answers.
-    #[test]
-    fn probe_reports_open_and_closed_ports() {        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    #[tokio::test]
+    async fn probe_reports_open_and_closed_ports() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let open = listener.local_addr().unwrap();
         // Nothing is listening here: bind, note the port, hand it back.
         let closed = {
@@ -515,8 +620,36 @@ mod tests {
             addr
         };
 
-        assert!(probe(Ipv4Addr::LOCALHOST, open.port()));
-        assert!(!probe(Ipv4Addr::LOCALHOST, closed.port()));
+        assert!(probe(Ipv4Addr::LOCALHOST, open.port()).await);
+        assert!(!probe(Ipv4Addr::LOCALHOST, closed.port()).await);
+    }
+
+    /// A wireless device is only really attached when the daemon holds it as
+    /// `device`; a USB serial is not an address at all, and one that is offline
+    /// or unauthorized still has to be attached.
+    #[test]
+    fn only_online_network_devices_count_as_connected() {
+        let devices = vec![
+            ("192.168.101.21:5555".to_string(), "device".to_string()),
+            ("192.168.101.22:5555".to_string(), "offline".to_string()),
+            (
+                "192.168.101.23:5555".to_string(),
+                "unauthorized".to_string(),
+            ),
+            ("8DF6R16806006359".to_string(), "device".to_string()),
+        ];
+
+        let addresses = network_devices(devices);
+
+        let up: Vec<Ipv4Addr> = addresses
+            .iter()
+            .filter(|(_, status)| status.as_str() == "device")
+            .map(|(ip, _)| *ip)
+            .collect();
+        assert_eq!(up, vec!["192.168.101.21".parse::<Ipv4Addr>().unwrap()]);
+        // The offline and unauthorized ones are known, just not attached.
+        assert_eq!(addresses.get(&"192.168.101.22".parse().unwrap()).unwrap(), "offline");
+        assert_eq!(addresses.len(), 3);
     }
 
     /// An entry the user adds names the network to sweep — its own address,

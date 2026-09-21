@@ -16,10 +16,13 @@ export interface ScanProgress {
   daemonPort: number;
   segment: string;
   scanned: number;
+  /** Addresses this sweep probes: the ones already connected are not probed. */
   total: number;
-  /** Addresses that answered, as `ip:5555`. */
+  /** Addresses that answered, as `ip:5555` — the newly found ones. */
   found: string[];
   connected: number;
+  /** Devices in the segment that were attached before the sweep ran. */
+  alreadyConnected: number;
   done: boolean;
   error?: string | null;
 }
