@@ -27,6 +27,12 @@
   margin-bottom: 6px;
   opacity: 0.7;
 }
+/* The sweep line is worth more attention than the timestamp above it. */
+.scanning {
+  font-size: 10px;
+  color: var(--accent);
+  margin-bottom: 6px;
+}
 .filterInput {
   width: 100%;
   background: var(--bg-primary);

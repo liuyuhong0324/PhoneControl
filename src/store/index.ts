@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { AdbServer, Device } from '../types';
+import type { AdbServer, Device, ScanProgress } from '../types';
 
 const PAGE_SIZE = 10;
 
@@ -7,6 +7,10 @@ interface AppStore {
   // Servers
   servers: AdbServer[];
   setServers: (servers: AdbServer[]) => void;
+
+  // Latest wireless-adb sweep reported by the backend (null until one runs)
+  scanProgress: ScanProgress | null;
+  setScanProgress: (progress: ScanProgress) => void;
 
   // Devices
   devices: Device[];
@@ -61,6 +65,9 @@ interface AppStore {
 export const useStore = create<AppStore>((set) => ({
   servers: [],
   setServers: (servers) => set({ servers }),
+
+  scanProgress: null,
+  setScanProgress: (scanProgress) => set({ scanProgress }),
 
   devices: [],
   setDevices: (devices) => set((s) => {

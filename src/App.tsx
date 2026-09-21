@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useStore } from './store';
 import { useDevices } from './hooks/useDevices';
+import { useScanProgress } from './hooks/useScanProgress';
 import { useStreamEvents } from './hooks/useStreamEvents';
 import { useStream } from './hooks/useStream';
 import { Sidebar } from './components/Sidebar/Sidebar';
@@ -14,6 +15,7 @@ export default function App() {
   const setServers = useStore((s) => s.setServers);
 
   useDevices();
+  useScanProgress();
   useStreamEvents();
   useStream();
 

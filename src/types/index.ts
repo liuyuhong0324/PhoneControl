@@ -1,8 +1,27 @@
+/**
+ * A server entry. What the user types into its `host` is also the network
+ * swept on refresh: `192.168.101.1` means the /24 that address sits in.
+ */
 export interface AdbServer {
   id: string;
   host: string;
   port: number;
   enabled: boolean;
+}
+
+/** Progress of a wireless-adb sweep, sent while the refresh button runs one. */
+export interface ScanProgress {
+  /** The daemon the sweep attaches through — the local one, always. */
+  daemonHost: string;
+  daemonPort: number;
+  segment: string;
+  scanned: number;
+  total: number;
+  /** Addresses that answered, as `ip:5555`. */
+  found: string[];
+  connected: number;
+  done: boolean;
+  error?: string | null;
 }
 
 export type DeviceStatus = 'online' | 'offline' | 'unauthorized' | 'connecting';

@@ -11,7 +11,7 @@
 }
 .addRow {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 56px 28px;
+  grid-template-columns: minmax(0, 1fr) 28px;
   gap: 6px;
   margin-bottom: 8px;
 }
@@ -22,15 +22,6 @@
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   padding: 5px 8px;
-}
-.portInput {
-  width: 100%;
-  min-width: 0;
-  background: var(--bg-primary);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  color: var(--text-primary);
-  padding: 5px 6px;
 }
 .addBtn {
   background: var(--accent);

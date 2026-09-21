@@ -18,6 +18,19 @@ use ws::{run_ws_server, WsHub};
 
 // ── Server management ────────────────────────────────────────────────────────
 
+/// Persisted form of the server list. Every command that mutates the list
+/// saves through here, so a new field only has to be added once.
+fn to_configs(servers: &[AdbServer]) -> Vec<ServerConfig> {
+    servers
+        .iter()
+        .map(|s| ServerConfig {
+            host: s.host.clone(),
+            port: s.port,
+            enabled: s.enabled,
+        })
+        .collect()
+}
+
 #[tauri::command]
 async fn add_server(
     host: String,
@@ -30,14 +43,7 @@ async fn add_server(
     }
     let srv = AdbServer::new(host, port);
     servers.push(srv.clone());
-    let cfgs: Vec<ServerConfig> = servers
-        .iter()
-        .map(|s| ServerConfig {
-            host: s.host.clone(),
-            port: s.port,
-            enabled: s.enabled,
-        })
-        .collect();
+    let cfgs = to_configs(&servers);
     drop(servers);
     save_servers(&cfgs)?;
     Ok(srv)
@@ -47,14 +53,7 @@ async fn add_server(
 async fn remove_server(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let mut servers = state.servers.lock().await;
     servers.retain(|s| s.id != id);
-    let cfgs: Vec<ServerConfig> = servers
-        .iter()
-        .map(|s| ServerConfig {
-            host: s.host.clone(),
-            port: s.port,
-            enabled: s.enabled,
-        })
-        .collect();
+    let cfgs = to_configs(&servers);
     drop(servers);
     save_servers(&cfgs)
 }
@@ -69,14 +68,7 @@ async fn toggle_server(
     if let Some(s) = servers.iter_mut().find(|s| s.id == id) {
         s.enabled = enabled;
     }
-    let cfgs: Vec<ServerConfig> = servers
-        .iter()
-        .map(|s| ServerConfig {
-            host: s.host.clone(),
-            port: s.port,
-            enabled: s.enabled,
-        })
-        .collect();
+    let cfgs = to_configs(&servers);
     drop(servers);
     save_servers(&cfgs)
 }
@@ -863,10 +855,30 @@ async fn launch_scrcpy(
 
 // ── Refresh devices ──────────────────────────────────────────────────────────
 
+/// Re-read the device list from every enabled adb server.
+///
+/// `scan` additionally sweeps each added entry's own address as a segment
+/// (`192.168.1.9` = the /24 it sits in) for wireless adb devices and attaches
+/// what it finds before polling, so the ones it connected are in the list the
+/// moment the refresh lands. Only the refresh button asks for it — the polls at
+/// startup run without it.
 #[tauri::command]
-async fn refresh_devices(state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
+async fn refresh_devices(
+    scan: Option<bool>,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
     let servers = Arc::clone(&state.servers);
-    tauri::async_runtime::spawn(poll_all_servers(servers, app));
+    let do_scan = scan.unwrap_or(false);
+    tauri::async_runtime::spawn(async move {
+        if do_scan {
+            // Snapshot before sweeping: a sweep lasts seconds, and the server
+            // list must stay editable (add/remove) while it runs.
+            let snapshot = servers.lock().await.clone();
+            adb::scan::scan_segments(snapshot, app.clone()).await;
+        }
+        poll_all_servers(servers, app).await;
+    });
     Ok(())
 }
 

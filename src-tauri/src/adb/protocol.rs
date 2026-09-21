@@ -18,6 +18,13 @@ use super::device::parse_adb_devices;
 use super::path::ensure_adb_server;
 
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to wait for the optional text after `OKAY` on `host:connect`.
+///
+/// Measured against the bundled daemon: a fresh connect answers a bare `OKAY`
+/// whatever happens, and only "already connected to ..." comes with a payload
+/// — in the same packet. The message is cosmetic (it is logged), so this is
+/// short: it is dead time for every address the sweep attaches.
+const MESSAGE_READ_TIMEOUT: Duration = Duration::from_millis(400);
 
 pub struct AdbClient {
     stream: TcpStream,
@@ -115,6 +122,12 @@ impl AdbClient {
     /// Read a length-prefixed payload (used by `host:devices` etc.).
     fn read_len_prefixed(&mut self) -> Result<String, String> {
         self.read_status()?;
+        self.read_len_prefixed_text()
+    }
+
+    /// Read the `%04x` + text payload that follows a status, without touching
+    /// the status itself.
+    fn read_len_prefixed_text(&mut self) -> Result<String, String> {
         let len_buf = read_exact(&mut self.stream, 4)?;
         let len = std::str::from_utf8(&len_buf)
             .ok()
@@ -135,6 +148,23 @@ impl AdbClient {
             self.read_len_prefixed()?
         };
         Ok(parse_adb_devices(&text))
+    }
+
+    /// `host:connect:<host>:<port>` — attach a device that is reachable over
+    /// TCP (wireless adb, `adb tcpip 5555`) to this adb server.
+    ///
+    /// Returns the daemon's own message ("connected to ...", "already
+    /// connected to ..."), which is what the adb CLI prints. That message is a
+    /// length-prefixed payload after `OKAY`; a daemon that already knows the
+    /// device may answer with a bare `OKAY`, so the payload is read on a short
+    /// timeout and its absence is not treated as a failure.
+    pub fn connect_device(&mut self, host: &str, port: u16) -> Result<String, String> {
+        self.send_cmd(&format!("host:connect:{host}:{port}"))?;
+        self.read_status()?;
+        self.set_read_timeout(MESSAGE_READ_TIMEOUT)?;
+        let message = self.read_len_prefixed_text().unwrap_or_default();
+        self.set_read_timeout(DEFAULT_READ_TIMEOUT)?;
+        Ok(message.trim().to_string())
     }
 
     /// Select the target device for subsequent commands on this connection.
@@ -274,6 +304,8 @@ impl AdbClient {
 
 #[cfg(test)]
 mod tests {
+    use super::AdbClient;
+
     fn encode_cmd(cmd: &str) -> Vec<u8> {
         let mut v = format!("{:04x}", cmd.len()).into_bytes();
         v.extend_from_slice(cmd.as_bytes());
@@ -325,5 +357,77 @@ mod tests {
         assert_eq!(len_le[1], 0x01); // 300 high byte
         assert_eq!(len_le[2], 0);
         assert_eq!(len_le[3], 0);
+    }
+
+    /// A fake daemon: reads one length-prefixed command, replies with the given
+    /// status/payload, and hands the command text back to the test.
+    fn fake_daemon(
+        reply: Vec<u8>,
+        close_after_reply: bool,
+    ) -> (u16, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut header = [0u8; 4];
+            sock.read_exact(&mut header).unwrap();
+            let len = usize::from_str_radix(std::str::from_utf8(&header).unwrap(), 16).unwrap();
+            let mut cmd = vec![0u8; len];
+            sock.read_exact(&mut cmd).unwrap();
+            sock.write_all(&reply).unwrap();
+            if close_after_reply {
+                // Dropping the socket is what a daemon without a message does.
+                return String::from_utf8(cmd).unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            String::from_utf8(cmd).unwrap()
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn connect_device_asks_for_host_connect_and_returns_the_message() {
+        let message = b"connected to 192.168.1.20:5555";
+        let mut reply = b"OKAY".to_vec();
+        reply.extend_from_slice(format!("{:04x}", message.len()).as_bytes());
+        reply.extend_from_slice(message);
+        let (port, daemon) = fake_daemon(reply, false);
+
+        let mut client = AdbClient::connect("127.0.0.1", port).unwrap();
+        let returned = client.connect_device("192.168.1.20", 5555).unwrap();
+
+        assert_eq!(daemon.join().unwrap(), "host:connect:192.168.1.20:5555");
+        assert_eq!(returned, "connected to 192.168.1.20:5555");
+    }
+
+    #[test]
+    fn connect_device_surfaces_a_refusal() {
+        let message = b"failed to connect to 192.168.1.20:5555";
+        let mut reply = b"FAIL".to_vec();
+        reply.extend_from_slice(format!("{:04x}", message.len()).as_bytes());
+        reply.extend_from_slice(message);
+        let (port, daemon) = fake_daemon(reply, false);
+
+        let mut client = AdbClient::connect("127.0.0.1", port).unwrap();
+        let error = client.connect_device("192.168.1.20", 5555).unwrap_err();
+
+        daemon.join().unwrap();
+        assert!(error.contains("failed to connect to 192.168.1.20:5555"), "{error}");
+    }
+
+    /// Some daemons answer a repeated connect with a bare OKAY. That is a
+    /// success, so it must not be reported as a failure.
+    #[test]
+    fn connect_device_tolerates_a_reply_without_a_message() {
+        let (port, daemon) = fake_daemon(b"OKAY".to_vec(), true);
+
+        let mut client = AdbClient::connect("127.0.0.1", port).unwrap();
+        let returned = client.connect_device("192.168.1.20", 5555).unwrap();
+
+        daemon.join().unwrap();
+        assert_eq!(returned, "");
     }
 }

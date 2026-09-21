@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useStore } from '../../store';
+import { scanProgressDetail, scanProgressText } from '../../utils/scanText';
 import styles from './DeviceList.module.css';
 
 const STATUS_LABEL: Record<string, string> = {
@@ -18,9 +19,15 @@ export function DeviceList() {
   const toggleDisableDevice = useStore((s) => s.toggleDisableDevice);
   const selectAll = useStore((s) => s.selectAll);
   const clearSelection = useStore((s) => s.clearSelection);
+  const scanProgress = useStore((s) => s.scanProgress);
   const [filter, setFilter] = useState('');
   const [refreshing, setRefreshing] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
+
+  // The command returns as soon as the sweep is spawned, so the button stays
+  // disabled off the sweep's own progress events, not off the await.
+  const scanning = !!scanProgress && !scanProgress.done;
+  const scanText = scanProgressText(scanProgress);
 
   const selectedCount = selectedSerials.size;
   const keyword = filter.trim().toLowerCase();
@@ -40,10 +47,12 @@ export function DeviceList() {
   }
 
   async function handleRefresh() {
-    if (refreshing) return;
+    if (refreshing || scanning) return;
     setRefreshing(true);
     try {
-      await invoke('refresh_devices');
+      // Also sweeps the segments configured on the server entries and attaches
+      // whatever answers, so wireless devices show up with this refresh.
+      await invoke('refresh_devices', { scan: true });
       setLastRefresh(new Date());
     } finally {
       setRefreshing(false);
@@ -64,10 +73,10 @@ export function DeviceList() {
           <button className={styles.actionBtn} onClick={selectAll}>All</button>
           <button className={styles.actionBtn} onClick={clearSelection}>None</button>
           <button
-            className={`${styles.actionBtn} ${refreshing ? styles.refreshing : ''}`}
+            className={`${styles.actionBtn} ${refreshing || scanning ? styles.refreshing : ''}`}
             onClick={handleRefresh}
-            title="Refresh device list"
-            disabled={refreshing}
+            title="Refresh device list (also sweeps segments set on the servers)"
+            disabled={refreshing || scanning}
           >
             ↻
           </button>
@@ -76,6 +85,15 @@ export function DeviceList() {
 
       {lastRefresh && (
         <div className={styles.lastRefresh}>Updated {formatLastRefresh(lastRefresh)}</div>
+      )}
+
+      {scanText && (
+        <div
+          className={scanning ? styles.scanning : styles.lastRefresh}
+          title={scanProgressDetail(scanProgress)}
+        >
+          {scanText}
+        </div>
       )}
 
       <input

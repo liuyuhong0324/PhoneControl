@@ -2,6 +2,7 @@ pub mod commands;
 pub mod device;
 pub mod path;
 pub mod protocol;
+pub mod scan;
 pub mod scrcpy_client;
 pub mod scrcpy_control;
 pub mod server;
